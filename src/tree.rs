@@ -134,6 +134,11 @@ impl Tree {
         self.node(id).span.clone()
     }
 
+    /// The source text under a byte range, if the range is valid.
+    pub fn source_slice(&self, span: Range<usize>) -> Option<&str> {
+        self.source.get(span)
+    }
+
     /// The node's children, in source order.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.node(id).children

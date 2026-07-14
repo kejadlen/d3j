@@ -1,3 +1,4 @@
+pub mod check;
 pub mod diff;
 pub mod error;
 pub mod hash;

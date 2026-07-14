@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::tree::{NodeId, Tree};
+use crate::zs;
 
 /// A matching between two trees: the order-preserving partial inclusion
 /// map from the design doc. This is the diff's first-class output; edit
@@ -249,6 +250,115 @@ pub fn align(src: &Tree, dst: &Tree, m: &mut Matching) {
                 work.push((cx, cy));
             }
         }
+    }
+}
+
+/// The largest residue (total nodes across both sides of a gap) that
+/// phase 3 will hand to Zhang–Shasha, whose DP is quartic in the worst
+/// case. Over budget, a gap stays unmatched: delete+insert is
+/// conservative, never wrong.
+const ZS_BUDGET: usize = 400;
+
+/// Diff phase 3: bounded Zhang–Shasha on the residues.
+///
+/// For every matched pair whose child gaps still hold unmatched nodes
+/// on both sides, the gap's forests — pruned of matched descendants,
+/// whose residues belong to their own pair's gap — run through the
+/// optimal edit mapping under phase costs: relabel 1 within a kind,
+/// never across kinds, insert/delete 1. Running per gap keeps every
+/// folded pair inside the fixed points that bound it, so the fold
+/// cannot cross an anchor and needs no demotion pass.
+pub fn refine(src: &Tree, dst: &Tree, m: &mut Matching) {
+    let pairs: Vec<(NodeId, NodeId)> = m.pairs().collect();
+    for (p, q) in pairs {
+        for (gap_x, gap_y) in gaps(m, src.children(p), dst.children(q)) {
+            if gap_x.is_empty() || gap_y.is_empty() {
+                continue;
+            }
+            let src_size: usize = gap_x.iter().map(|&n| pruned_size(src, n, m, true)).sum();
+            let dst_size: usize = gap_y.iter().map(|&n| pruned_size(dst, n, m, false)).sum();
+            if src_size.saturating_add(dst_size) > ZS_BUDGET {
+                continue;
+            }
+            let src_forest = zs::ZsTree {
+                value: None,
+                children: gap_x
+                    .iter()
+                    .map(|&n| pruned_tree(src, n, m, true))
+                    .collect(),
+            };
+            let dst_forest = zs::ZsTree {
+                value: None,
+                children: gap_y
+                    .iter()
+                    .map(|&n| pruned_tree(dst, n, m, false))
+                    .collect(),
+            };
+            let mapped = zs::mapping(&src_forest, &dst_forest, |s, d| match (s, d) {
+                // The virtual forest roots pair freely with each other.
+                (None, None) => Some(0),
+                (Some(x), Some(y)) if src.kind_id(x) == dst.kind_id(y) => {
+                    if src.label(x) == dst.label(y) {
+                        Some(0)
+                    } else {
+                        Some(1)
+                    }
+                }
+                // Cross-kind (or a real node against a virtual root):
+                // never matched.
+                _ => None,
+            });
+            for (s, d) in mapped {
+                if let (Some(x), Some(y)) = (s, d) {
+                    m.insert(x, y);
+                }
+            }
+        }
+    }
+}
+
+/// Node count of `node`'s subtree with matched descendants pruned.
+fn pruned_size(tree: &Tree, node: NodeId, m: &Matching, src_side: bool) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        count = count.saturating_add(1);
+        stack.extend(tree.children(n).iter().copied().filter(|&c| {
+            let matched = if src_side {
+                m.image(c).is_some()
+            } else {
+                m.preimage(c).is_some()
+            };
+            !matched
+        }));
+    }
+    count
+}
+
+/// `node`'s subtree as a ZS tree, matched descendants pruned. A matched
+/// descendant's own residues belong to that pair's gaps, not this one.
+fn pruned_tree(
+    tree: &Tree,
+    node: NodeId,
+    m: &Matching,
+    src_side: bool,
+) -> zs::ZsTree<Option<NodeId>> {
+    zs::ZsTree {
+        value: Some(node),
+        children: tree
+            .children(node)
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let matched = if src_side {
+                    m.image(c).is_some()
+                } else {
+                    m.preimage(c).is_some()
+                };
+                !matched
+            })
+            .map(|c| pruned_tree(tree, c, m, src_side))
+            .collect(),
     }
 }
 
@@ -683,6 +793,65 @@ mod tests {
         let a_ident = a.nodes().find(|&n| a.label(n) == Some("b"));
         assert_eq!(o_ident.and_then(|n| m.image(n)), None);
         assert_eq!(a_ident.and_then(|n| m.preimage(n)), None);
+        Ok(())
+    }
+
+    fn phase123(o: &Tree, a: &Tree) -> Matching {
+        let mut m = anchor(o, a);
+        align(o, a, &mut m);
+        refine(o, a, &mut m);
+        m
+    }
+
+    #[test]
+    fn zhang_shasha_matches_a_nested_restructure() -> Result<(), Error> {
+        // A subtree moved one level deeper with an edit inside it. The
+        // duplicated [1, 2] defeats hash anchoring and the alignment
+        // passes stop at the array/leaf kind wall, so only phase 3 can
+        // still match the 1 and 2 leaves into the deeper array.
+        let o = parse_json("[[1, 2], [1, 2]]")?;
+        let a = parse_json("[[[1, 2, 9]], [1, 2]]")?;
+        let m = phase123(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        // Every O number has an image with the same label...
+        for s in find_kind(&o, "number") {
+            let image_label = m.image(s).and_then(|d| a.label(d));
+            assert_eq!(image_label, o.label(s));
+        }
+        // ...while the freshly inserted 9 has no preimage.
+        assert_eq!(find_number(&a, "9").and_then(|d| m.preimage(d)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn zhang_shasha_relabels_a_renamed_function() -> Result<(), Error> {
+        // Phase 2 leaves the differing identifiers unmatched; phase 3
+        // matches them as a relabel (cost 1 beats delete+insert at 2).
+        let o = parse_rust("fn a() {}")?;
+        let a = parse_rust("fn b() {}")?;
+        let m = phase123(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        let o_ident = o.nodes().find(|&n| o.label(n) == Some("a"));
+        let image_label = o_ident.and_then(|n| m.image(n)).and_then(|d| a.label(d));
+        assert_eq!(image_label, Some("b"));
+        Ok(())
+    }
+
+    #[test]
+    fn over_budget_residues_stay_unmatched() -> Result<(), Error> {
+        // The nested-restructure scenario scaled past the ZS budget:
+        // the oversized gap is left as delete+insert — conservative,
+        // never wrong. Only the intact second copy's numbers match.
+        let ns = (1000..1200)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let o = parse_json(&format!("[[{ns}], [{ns}]]"))?;
+        let a = parse_json(&format!("[[[{ns}, 9]], [{ns}]]"))?;
+        let m = phase123(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        let matched_numbers = m.pairs().filter(|&(s, _)| o.kind(s) == "number").count();
+        assert_eq!(matched_numbers, 200);
         Ok(())
     }
 

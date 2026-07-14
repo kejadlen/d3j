@@ -162,10 +162,20 @@ pub fn anchor(src: &Tree, dst: &Tree) -> Matching {
     let src_unique = unique_subtrees(src);
     let dst_unique = unique_subtrees(dst);
 
+    // Anchors assert content identity, so a candidate must contain at
+    // least one labeled leaf. Structure-only subtrees — empty blocks,
+    // bare token runs — collide across unrelated positions (two `{}`
+    // class bodies at different nesting levels hash equal) and would
+    // pin the diff to the wrong twin.
+    let has_label = labeled_subtrees(src);
+
     let mut candidates: Vec<(NodeId, NodeId)> = src_unique
         .iter()
         .filter_map(|(hash, &s)| {
             let s = s?;
+            if !has_label.get(s.index()).copied().unwrap_or(false) {
+                return None;
+            }
             let d = dst_unique.get(hash).copied().flatten()?;
             Some((s, d))
         })
@@ -616,6 +626,24 @@ fn unique_subtrees(tree: &Tree) -> HashMap<u64, Option<NodeId>> {
     map
 }
 
+/// Whether each subtree contains a labeled leaf, indexed like the
+/// arena.
+fn labeled_subtrees(tree: &Tree) -> Vec<bool> {
+    let ids: Vec<_> = tree.nodes().collect();
+    let mut labeled = vec![false; ids.len()];
+    for &id in ids.iter().rev() {
+        let own = tree.label(id).is_some()
+            || tree
+                .children(id)
+                .iter()
+                .any(|child| labeled.get(child.index()).copied().unwrap_or(false));
+        if let Some(slot) = labeled.get_mut(id.index()) {
+            *slot = own;
+        }
+    }
+    labeled
+}
+
 /// Node counts per subtree, indexed like the arena.
 fn subtree_sizes(tree: &Tree) -> Vec<usize> {
     let ids: Vec<_> = tree.nodes().collect();
@@ -937,6 +965,18 @@ mod tests {
         let m = anchor(&o, &a);
         assert_eq!(m.pairs().count(), o.nodes().count());
         assert!(m.validate(&o, &a).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn structure_only_subtrees_do_not_anchor() -> Result<(), Error> {
+        // O's inner [] and A's array hash equal and occur once each,
+        // but an empty array carries no content identity — anchoring
+        // them would pin the diff across nesting levels.
+        let o = parse_json("[[]]")?;
+        let a = parse_json("[]")?;
+        let m = anchor(&o, &a);
+        assert_eq!(m.pairs().count(), 0);
         Ok(())
     }
 

@@ -21,6 +21,10 @@ pub(crate) struct Ctx<'t> {
 /// A conflict rule over one (edit-from-A, edit-from-B) pair.
 type PairRule = fn(&Edit, &Edit, &Ctx) -> Option<Conflict>;
 
+/// Where an insertion lands: the parent's O preimage plus the O
+/// preimage of the nearest preceding matched sibling.
+type Slot = (NodeId, Option<NodeId>);
+
 const PAIR_RULES: &[PairRule] = &[relabel_relabel, relabel_delete, insert_delete];
 
 /// Runs the pairwise rules over every cross-branch edit pair and the
@@ -46,6 +50,7 @@ pub(crate) fn conflicts(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit]) -> Vec<Co
         }
     }
     insert_insert(ctx, edits_a, edits_b, &mut found);
+    name_collision(ctx, edits_a, edits_b, &mut found);
     delete_delete(ctx, edits_a, edits_b, &mut found);
     found
 }
@@ -360,15 +365,86 @@ fn insert_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<
     }
 }
 
+/// name-collision: both branches inserted same-named definitions
+/// under the same O parent at different slots. The builder grafts
+/// both, yielding duplicate definitions — two `class Hello`, a JSON
+/// object holding the same key twice — that no slot-based rule sees:
+/// insert-insert wants a shared slot, and dedupe cannot merge grafts
+/// landing in different places. A node's "name" is its `name` or
+/// `key` field child, keeping the rule grammar-driven; that is
+/// deliberately coarser than real signatures, so concurrently
+/// inserting two distinct same-name Java overloads conflicts too.
+/// Same-slot pairs are skipped: equal sequences dedupe and unequal
+/// ones are already insert-insert conflicts.
+fn name_collision(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<Conflict>) {
+    let names_a = insert_names(ctx.a, ctx.f, edits_a);
+    let names_b = insert_names(ctx.b, ctx.g, edits_b);
+    for (name, inserts_a) in &names_a {
+        let Some(inserts_b) = names_b.get(name) else {
+            continue;
+        };
+        for (slot_a, node_a) in inserts_a {
+            for (slot_b, node_b) in inserts_b {
+                if slot_a == slot_b {
+                    continue;
+                }
+                let conflict = Conflict {
+                    span_o: Some(ctx.o.span(name.0)),
+                    span_a: Some(ctx.a.span(*node_a)),
+                    span_b: Some(ctx.b.span(*node_b)),
+                    rule: "name-collision",
+                };
+                if !found.contains(&conflict) {
+                    found.push(conflict);
+                }
+            }
+        }
+    }
+}
+
+/// A branch's named top-level insertions, keyed by the O parent they
+/// graft under plus the name text, valued by (slot, inserted node).
+fn insert_names<'t>(
+    tree: &'t Tree,
+    matching: &Matching,
+    script: &[Edit],
+) -> HashMap<(NodeId, &'t str), Vec<(Slot, NodeId)>> {
+    let mut names: HashMap<(NodeId, &'t str), Vec<(Slot, NodeId)>> = HashMap::new();
+    for edit in script {
+        let Edit::Insert(node) = edit else {
+            continue;
+        };
+        let Some(slot) = insert_anchor(tree, matching, *node) else {
+            continue;
+        };
+        let Some(name) = node_name(tree, *node) else {
+            continue;
+        };
+        names.entry((slot.0, name)).or_default().push((slot, *node));
+    }
+    names
+}
+
+/// The text of a node's `name` or `key` field child, if it has one.
+fn node_name(tree: &Tree, node: NodeId) -> Option<&str> {
+    let language = tree.lang().language();
+    tree.children(node).iter().find_map(|&child| {
+        let field = tree
+            .field_id(child)
+            .and_then(|fid| language.field_name_for_id(fid.get()))?;
+        if field == "name" || field == "key" {
+            tree.source_slice(tree.span(child))
+        } else {
+            None
+        }
+    })
+}
+
 /// Groups a branch's top-level insertions by slot, in sibling order
 /// (the edit script lists inserts in pre-order, so same-slot siblings
 /// arrive left to right).
-fn insert_slots(
-    tree: &Tree,
-    matching: &Matching,
-    script: &[Edit],
-) -> HashMap<(NodeId, Option<NodeId>), Vec<NodeId>> {
-    let mut slots: HashMap<(NodeId, Option<NodeId>), Vec<NodeId>> = HashMap::new();
+fn insert_slots(tree: &Tree, matching: &Matching, script: &[Edit]) -> HashMap<Slot, Vec<NodeId>> {
+    let mut slots: HashMap<Slot, Vec<NodeId>> = HashMap::new();
     for edit in script {
         let Edit::Insert(node) = edit else {
             continue;
@@ -387,15 +463,10 @@ fn covering_span(tree: &Tree, seq: &[NodeId]) -> Option<std::ops::Range<usize>> 
     Some(start..end)
 }
 
-/// The slot an inserted node lands in: its parent's O preimage plus
-/// the O preimage of the nearest preceding matched sibling. `None`
-/// for nested insertions (their parent is inserted too — they ride
-/// along with the top-level graft).
-fn insert_anchor(
-    tree: &Tree,
-    matching: &Matching,
-    node: NodeId,
-) -> Option<(NodeId, Option<NodeId>)> {
+/// The slot an inserted node lands in. `None` for nested insertions
+/// (their parent is inserted too — they ride along with the
+/// top-level graft).
+fn insert_anchor(tree: &Tree, matching: &Matching, node: NodeId) -> Option<Slot> {
     let parent = tree.parent(node)?;
     let parent_o = matching.preimage(parent)?;
     let mut left = None;

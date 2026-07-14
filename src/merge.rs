@@ -735,6 +735,70 @@ mod tests {
     }
 
     #[test]
+    fn same_key_inserted_at_different_slots_conflicts() -> Result<(), Error> {
+        // A adds "k" at the front, B adds "k" at the back, values
+        // differ. No shared slot, so insert-insert is blind; without
+        // name-collision the merge holds the key twice.
+        let conflicts = assert_conflicts(
+            "json",
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"k": 8, "a": 1, "b": 2}"#,
+            r#"{"a": 1, "b": 2, "k": 9}"#,
+            "name-collision",
+        )?;
+        // The conflict carries both inserted pairs.
+        let a = parse(r#"{"k": 8, "a": 1, "b": 2}"#, "json")?;
+        let witnessed = conflicts.iter().any(|c| {
+            c.rule == "name-collision"
+                && c.span_a
+                    .clone()
+                    .and_then(|span| a.source_slice(span))
+                    .is_some_and(|text| text.contains("\"k\""))
+                && c.span_b.is_some()
+        });
+        assert!(witnessed);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_key_inserted_at_different_slots_conflicts() -> Result<(), Error> {
+        // Identical values still conflict: dedupe only merges grafts
+        // sharing a slot, so accepting this would keep both copies.
+        assert_conflicts(
+            "json",
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"k": 8, "a": 1, "b": 2}"#,
+            r#"{"a": 1, "b": 2, "k": 8}"#,
+            "name-collision",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn same_class_inserted_at_different_slots_conflicts() -> Result<(), Error> {
+        assert_conflicts(
+            "java",
+            "class P { }\nclass Q { }",
+            "class N { int x; }\nclass P { }\nclass Q { }",
+            "class P { }\nclass Q { }\nclass N { boolean y; }",
+            "name-collision",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn same_key_inserted_into_different_objects_merges() -> Result<(), Error> {
+        // Same name under different parents is no collision.
+        assert_merges(
+            "json",
+            r#"{"x": {"a": 1}, "y": {"b": 2}}"#,
+            r#"{"x": {"k": 1, "a": 1}, "y": {"b": 2}}"#,
+            r#"{"x": {"a": 1}, "y": {"b": 2, "k": 2}}"#,
+            r#"{"x": {"k": 1, "a": 1}, "y": {"b": 2, "k": 2}}"#,
+        )
+    }
+
+    #[test]
     fn relabel_and_delete_in_different_functions_merge() -> Result<(), Error> {
         // The rule must not fire when the relabel is outside the
         // deleted subtree: A deletes fn b, B renames a call in fn a.

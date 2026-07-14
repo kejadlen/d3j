@@ -11,8 +11,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use crate::diff::{Matching, Shape, diff};
+use crate::diff::{Matching, Shape, diff, edits};
 use crate::error::Error;
+use crate::rules;
 use crate::tree::{NodeId, Tree};
 
 /// Where a merge node's content comes from: a surviving O node, or a
@@ -110,6 +111,19 @@ pub enum MergeOutcome {
 pub fn merge(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeOutcome, Error> {
     let f = diff(o, a);
     let g = diff(o, b);
+
+    let ctx = rules::Ctx {
+        o,
+        a,
+        b,
+        f: &f,
+        g: &g,
+    };
+    let conflicts = rules::conflicts(&ctx, &edits(o, a, &f), &edits(o, b, &g));
+    if !conflicts.is_empty() {
+        return Ok(MergeOutcome::Conflicts(conflicts));
+    }
+
     let mut builder = Builder {
         o,
         a,
@@ -390,6 +404,74 @@ mod tests {
     fn one_sided_edits_pass_through() -> Result<(), Error> {
         assert_merges("json", "[1, 2]", "[1, 2, 3]", "[1, 2]", "[1, 2, 3]")?;
         assert_merges("json", "[1, 2]", "[1, 2]", "[2]", "[2]")
+    }
+
+    fn assert_conflicts(
+        lang: &str,
+        o: &str,
+        a: &str,
+        b: &str,
+        rule: &str,
+    ) -> Result<Vec<Conflict>, Error> {
+        let o = parse(o, lang)?;
+        let a = parse(a, lang)?;
+        let b = parse(b, lang)?;
+        match merge(&o, &a, &b)? {
+            MergeOutcome::Merged(m) => {
+                panic!("expected conflicts, got a merge: {:?}", m.shape(&o, &a, &b));
+            }
+            MergeOutcome::Conflicts(conflicts) => {
+                assert!(!conflicts.is_empty());
+                assert!(
+                    conflicts.iter().all(|c| c.rule == rule),
+                    "expected only {rule}: {conflicts:?}"
+                );
+                Ok(conflicts)
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_renames_conflict() -> Result<(), Error> {
+        let conflicts = assert_conflicts(
+            "rust",
+            "fn a() {}",
+            "fn b() {}",
+            "fn c() {}",
+            "relabel-relabel",
+        )?;
+        let a = parse("fn b() {}", "rust")?;
+        let witnessed = conflicts.iter().any(|c| {
+            c.span_a
+                .clone()
+                .and_then(|span| a.source_slice(span))
+                .is_some_and(|text| text == "b")
+        });
+        assert!(witnessed);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_renames_still_merge() -> Result<(), Error> {
+        assert_merges("rust", "fn a() {}", "fn b() {}", "fn b() {}", "fn b() {}")
+    }
+
+    #[test]
+    fn conflicting_insertions_at_one_slot_conflict() -> Result<(), Error> {
+        assert_conflicts(
+            "rust",
+            "fn f() { x(); }",
+            "fn f() { x(); y(); }",
+            "fn f() { x(); z(); }",
+            "insert-insert",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn different_value_insertions_at_one_slot_conflict() -> Result<(), Error> {
+        assert_conflicts("json", "[1]", "[1, 9]", "[1, 8]", "insert-insert")?;
+        Ok(())
     }
 
     #[test]

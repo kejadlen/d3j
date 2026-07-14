@@ -4,6 +4,7 @@ pub mod error;
 pub mod hash;
 pub mod lang;
 pub mod merge;
+mod rules;
 pub mod tree;
 pub mod zs;
 

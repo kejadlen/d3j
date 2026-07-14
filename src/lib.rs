@@ -3,6 +3,7 @@ pub mod diff;
 pub mod error;
 pub mod hash;
 pub mod lang;
+pub mod merge;
 pub mod tree;
 pub mod zs;
 

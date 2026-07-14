@@ -1,4 +1,5 @@
 pub mod error;
+pub mod hash;
 pub mod lang;
 pub mod tree;
 

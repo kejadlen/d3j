@@ -12,6 +12,14 @@ use crate::lang::Lang;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(usize);
 
+impl NodeId {
+    /// The arena index, for dense per-node side tables (subtree hashes,
+    /// matching maps).
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// An owned syntax tree lifted from a tree-sitter CST.
 ///
 /// Nodes live in an arena in pre-order (the root is index 0). The lift
@@ -23,6 +31,7 @@ pub struct NodeId(usize);
 pub struct Tree {
     source: String,
     nodes: Vec<NodeData>,
+    hashes: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -69,10 +78,13 @@ impl Tree {
         }
 
         let nodes = lift(root);
-        Ok(Self {
+        let mut tree = Self {
             source: source.into(),
             nodes,
-        })
+            hashes: Vec::new(),
+        };
+        tree.hashes = crate::hash::compute(&tree);
+        Ok(tree)
     }
 
     /// The root node (arena index 0).
@@ -130,6 +142,15 @@ impl Tree {
     /// field.
     pub fn field_id(&self, id: NodeId) -> Option<NonZeroU16> {
         self.node(id).field_id
+    }
+
+    /// The node's subtree Merkle hash: (kind_id, label, child hashes),
+    /// position-independent. Equal hashes mean structurally identical
+    /// subtrees, within or across trees.
+    pub fn hash(&self, id: NodeId) -> u64 {
+        // Same invariant as node(): ids index this arena.
+        #[allow(clippy::indexing_slicing)]
+        self.hashes[id.0]
     }
 
     fn node(&self, id: NodeId) -> &NodeData {

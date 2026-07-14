@@ -66,6 +66,9 @@ pub fn check(o: &Tree, a: &Tree, b: &Tree, m: &Tree) -> Report {
     // 1. No extra insertion: every M node has a preimage under i1 or
     //    i2 — it came from somewhere.
     for node in m.nodes() {
+        if fungible_separator(m, node) {
+            continue;
+        }
         if i1.preimage(node).is_none() && i2.preimage(node).is_none() {
             violations.push(Violation::ExtraInsertion {
                 node,
@@ -81,6 +84,9 @@ pub fn check(o: &Tree, a: &Tree, b: &Tree, m: &Tree) -> Report {
     // 3. No extra deletion: an O node both branches kept must reach M
     //    through both routes, and the routes must agree (i1∘f = i2∘g).
     for node in o.nodes() {
+        if fungible_separator(o, node) {
+            continue;
+        }
         if let (Some(in_a), Some(in_b)) = (f.image(node), g.image(node)) {
             let via_a = i1.image(in_a);
             let via_b = i2.image(in_b);
@@ -97,6 +103,9 @@ pub fn check(o: &Tree, a: &Tree, b: &Tree, m: &Tree) -> Report {
     // 4. No missed deletion: an O node one branch deleted must not
     //    sneak into M through the other branch.
     for node in o.nodes() {
+        if fungible_separator(o, node) {
+            continue;
+        }
         let reaches = match (f.image(node), g.image(node)) {
             (None, Some(via)) => i2.image(via).is_some(),
             (Some(via), None) => i1.image(via).is_some(),
@@ -116,6 +125,20 @@ pub fn check(o: &Tree, a: &Tree, b: &Tree, m: &Tree) -> Report {
     }
 }
 
+/// Anonymous tokens under a commutative parent are fungible
+/// separators, exempt from all four conditions. A cross-branch union
+/// merge makes their attribution ambiguous — both branches' commas
+/// legitimately claim the same merged comma, orphaning its twin — and
+/// the parse itself (verified before the conditions run) already pins
+/// how many separators the output holds. Named nodes under the same
+/// parent stay fully checked.
+fn fungible_separator(tree: &Tree, node: NodeId) -> bool {
+    !tree.is_named(node)
+        && tree
+            .parent(node)
+            .is_some_and(|parent| tree.lang().is_commutative(tree.kind(parent)))
+}
+
 /// Condition 2 for one branch: nodes the branch inserted (no preimage
 /// under its diff from O) must have an image in M.
 fn missed_insertions(
@@ -126,6 +149,9 @@ fn missed_insertions(
     violations: &mut Vec<Violation>,
 ) {
     for node in branch_tree.nodes() {
+        if fungible_separator(branch_tree, node) {
+            continue;
+        }
         if from_o.preimage(node).is_none() && to_m.image(node).is_none() {
             violations.push(Violation::MissedInsertion {
                 branch,
@@ -269,6 +295,64 @@ mod tests {
     fn identical_inputs_pass() -> Result<(), Error> {
         let report = check_json("[1]", "[1]", "[1]", "[1]")?;
         assert!(report.is_correct());
+        Ok(())
+    }
+
+    #[test]
+    fn union_merged_separators_are_not_extra_insertions() -> Result<(), Error> {
+        // Each branch adds one entry, each with its comma. The two
+        // matchings into M are derived independently, so both commas
+        // can claim the same merged comma, orphaning its twin; the
+        // fungible-separator exemption keeps that from flagging.
+        let report = check_json(
+            r#"{"a": 1}"#,
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"a": 1, "c": 3}"#,
+            r#"{"a": 1, "b": 2, "c": 3}"#,
+        )?;
+        assert_eq!(report.violations, Vec::new());
+        assert!(report.is_correct());
+        Ok(())
+    }
+
+    #[test]
+    fn named_nodes_under_commutative_parents_stay_checked() -> Result<(), Error> {
+        // The exemption covers anonymous separators only: an invented
+        // pair inside the object still flags.
+        let report = check_json(
+            r#"{"a": 1}"#,
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"a": 1}"#,
+            r#"{"a": 1, "b": 2, "d": 4}"#,
+        )?;
+        assert!(!report.violations.is_empty());
+        assert!(report.violations.iter().any(|v| match v {
+            Violation::ExtraInsertion { span, .. } => {
+                let m = parse_json(r#"{"a": 1, "b": 2, "d": 4}"#);
+                m.is_ok_and(|m| {
+                    m.source_slice(span.clone())
+                        .is_some_and(|s| s.contains("4"))
+                })
+            }
+            _ => false,
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn separators_under_non_commutative_parents_stay_checked() -> Result<(), Error> {
+        // An array is not commutative, so a merge that loses an
+        // element (and its comma) both branches kept flags the comma
+        // too — the exemption must not reach it.
+        let report = check_json("[1, 2]", "[1, 2]", "[1, 2]", "[1]")?;
+        let flags_comma = report.violations.iter().any(|v| match v {
+            Violation::ExtraDeletion { span, .. } => {
+                let o = parse_json("[1, 2]");
+                o.is_ok_and(|o| o.source_slice(span.clone()) == Some(","))
+            }
+            _ => false,
+        });
+        assert!(flags_comma, "{:?}", report.violations);
         Ok(())
     }
 }

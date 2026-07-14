@@ -51,6 +51,7 @@ pub(crate) fn conflicts(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit]) -> Vec<Co
     }
     insert_insert(ctx, edits_a, edits_b, &mut found);
     name_collision(ctx, edits_a, edits_b, &mut found);
+    duplicate_insert(ctx, edits_a, edits_b, &mut found);
     delete_delete(ctx, edits_a, edits_b, &mut found);
     found
 }
@@ -340,6 +341,14 @@ fn node_satisfies(
 /// parent image, same nearest preceding matched sibling — but the
 /// inserted subtree sequences differ. Equal sequences at the same
 /// slot are one edit made twice and dedupe instead.
+///
+/// Under a commutative parent (imports, use declarations, type
+/// members, JSON object entries) differing sequences are no conflict
+/// either: child order carries no meaning there, so the builder
+/// merges the two runs as a union — provided both runs decompose into
+/// element groups. A run that does not (a trailing separator, or a
+/// trailing attribute with its target outside the run) cannot be
+/// unioned without breaking what a branch wrote.
 fn insert_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<Conflict>) {
     let slots_a = insert_slots(ctx.a, ctx.f, edits_a);
     let slots_b = insert_slots(ctx.b, ctx.g, edits_b);
@@ -351,6 +360,12 @@ fn insert_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<
             seq.iter().map(|&n| tree.hash(n)).collect()
         };
         if hashes(ctx.a, seq_a) == hashes(ctx.b, seq_b) {
+            continue;
+        }
+        if ctx.o.lang().is_commutative(ctx.o.kind(anchor.0))
+            && element_groups(ctx.a, seq_a).is_some()
+            && element_groups(ctx.b, seq_b).is_some()
+        {
             continue;
         }
         let conflict = Conflict {
@@ -374,13 +389,105 @@ fn insert_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<
 /// `key` field child, keeping the rule grammar-driven; that is
 /// deliberately coarser than real signatures, so concurrently
 /// inserting two distinct same-name Java overloads conflicts too.
-/// Same-slot pairs are skipped: equal sequences dedupe and unequal
-/// ones are already insert-insert conflicts.
+/// Same-slot pairs are skipped under a non-commutative parent (equal
+/// sequences dedupe and unequal ones are already insert-insert
+/// conflicts); under a commutative parent unequal sequences merge, so
+/// two same-named insertions must conflict here — unless their whole
+/// element groups are equal, which is exactly what the builder's
+/// dedupe merges into one copy. Comparing groups rather than the
+/// named nodes alone keeps an attributed insertion distinct from a
+/// bare one.
 fn name_collision(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<Conflict>) {
     let names_a = insert_names(ctx.a, ctx.f, edits_a);
     let names_b = insert_names(ctx.b, ctx.g, edits_b);
+    let slots_a = insert_slots(ctx.a, ctx.f, edits_a);
+    let slots_b = insert_slots(ctx.b, ctx.g, edits_b);
     for (name, inserts_a) in &names_a {
         let Some(inserts_b) = names_b.get(name) else {
+            continue;
+        };
+        for (slot_a, node_a) in inserts_a {
+            for (slot_b, node_b) in inserts_b {
+                if slot_a == slot_b
+                    && (!ctx.o.lang().is_commutative(ctx.o.kind(slot_a.0))
+                        || dedupes_together(
+                            (ctx.a, &slots_a, *node_a),
+                            (ctx.b, &slots_b, *node_b),
+                            slot_a,
+                        ))
+                {
+                    continue;
+                }
+                let conflict = Conflict {
+                    span_o: Some(ctx.o.span(name.0)),
+                    span_a: Some(ctx.a.span(*node_a)),
+                    span_b: Some(ctx.b.span(*node_b)),
+                    rule: "name-collision",
+                };
+                if !found.contains(&conflict) {
+                    found.push(conflict);
+                }
+            }
+        }
+    }
+}
+
+/// Whether two same-slot insertions sit in equal element groups, so
+/// the builder's group-wise dedupe merges them into one copy.
+fn dedupes_together(
+    a: (&Tree, &HashMap<Slot, Vec<NodeId>>, NodeId),
+    b: (&Tree, &HashMap<Slot, Vec<NodeId>>, NodeId),
+    slot: &Slot,
+) -> bool {
+    let group_hashes = |(tree, slots, node): (&Tree, &HashMap<Slot, Vec<NodeId>>, NodeId)| {
+        let run = slots.get(slot)?;
+        let groups = element_groups(tree, run)?;
+        let group = groups.into_iter().find(|group| group.contains(&node))?;
+        Some(
+            group
+                .iter()
+                .map(|&member| tree.hash(member))
+                .collect::<Vec<u64>>(),
+        )
+    };
+    let hashes_a = group_hashes(a);
+    hashes_a.is_some() && hashes_a == group_hashes(b)
+}
+
+/// duplicate-insert: both branches inserted the identical nameless
+/// element — a use declaration, an import — under the same
+/// commutative O parent at different slots. Cross-branch dedupe only
+/// merges grafts sharing a slot and name-collision only sees elements
+/// with a `name`/`key` field, so without this rule the union merge
+/// silently lands the element twice. Separators are excluded (every
+/// comma equals every other comma); named elements are
+/// name-collision's domain.
+fn duplicate_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<Conflict>) {
+    let elements = |tree: &Tree, matching: &Matching, script: &[Edit]| {
+        let mut map: HashMap<(NodeId, u64), Vec<(Slot, NodeId)>> = HashMap::new();
+        for edit in script {
+            let Edit::Insert(node) = edit else {
+                continue;
+            };
+            if !tree.is_named(*node) || node_name(tree, *node).is_some() {
+                continue;
+            }
+            let Some(slot) = insert_anchor(tree, matching, *node) else {
+                continue;
+            };
+            if !ctx.o.lang().is_commutative(ctx.o.kind(slot.0)) {
+                continue;
+            }
+            map.entry((slot.0, tree.hash(*node)))
+                .or_default()
+                .push((slot, *node));
+        }
+        map
+    };
+    let elements_a = elements(ctx.a, ctx.f, edits_a);
+    let elements_b = elements(ctx.b, ctx.g, edits_b);
+    for (key, inserts_a) in &elements_a {
+        let Some(inserts_b) = elements_b.get(key) else {
             continue;
         };
         for (slot_a, node_a) in inserts_a {
@@ -389,10 +496,10 @@ fn name_collision(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec
                     continue;
                 }
                 let conflict = Conflict {
-                    span_o: Some(ctx.o.span(name.0)),
+                    span_o: Some(ctx.o.span(key.0)),
                     span_a: Some(ctx.a.span(*node_a)),
                     span_b: Some(ctx.b.span(*node_b)),
-                    rule: "name-collision",
+                    rule: "duplicate-insert",
                 };
                 if !found.contains(&conflict) {
                     found.push(conflict);
@@ -454,6 +561,27 @@ fn insert_slots(tree: &Tree, matching: &Matching, script: &[Edit]) -> HashMap<Sl
         }
     }
     slots
+}
+
+/// Splits an inserted run into element groups: each group is a named
+/// node together with the anonymous separators and forward-binding
+/// prefixes preceding it (a JSON insertion is `, "k": v` — the comma
+/// travels with its pair; a Rust `#[attr]` travels with the item it
+/// governs). `None` when trailing prefix nodes remain: a separator
+/// with no element cannot participate in a union merge, and a
+/// trailing attribute governs something *outside* the run, which a
+/// union would displace. Group-wise dedupe in the builder relies on
+/// the same decomposition.
+pub(crate) fn element_groups(tree: &Tree, run: &[NodeId]) -> Option<Vec<Vec<NodeId>>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    for &node in run {
+        current.push(node);
+        if tree.is_named(node) && !tree.lang().binds_forward(tree.kind(node)) {
+            groups.push(std::mem::take(&mut current));
+        }
+    }
+    current.is_empty().then_some(groups)
 }
 
 /// The byte range covering a sequence of nodes.

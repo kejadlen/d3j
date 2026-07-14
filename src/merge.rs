@@ -288,14 +288,6 @@ enum Branch {
     B,
 }
 
-/// A graft placed in a slot: its subtree hash for cross-branch dedupe
-/// and whether it can still absorb a duplicate B insertion.
-struct SlotEntry {
-    hash: u64,
-    id: MergedId,
-    dedupes_b: bool,
-}
-
 struct Builder<'t> {
     o: &'t Tree,
     a: &'t Tree,
@@ -335,57 +327,68 @@ impl Builder<'_> {
         let base_position: HashMap<NodeId, usize> =
             base.iter().enumerate().map(|(i, &c)| (c, i)).collect();
 
-        // Slots: grafts landing before base[i] live in slots[i]; the
-        // final slot holds end-of-list grafts. Each graft records its
-        // subtree hash so an identical B insertion in the same slot
-        // dedupes against A's.
-        let mut slots: Vec<Vec<SlotEntry>> = Vec::new();
-        slots.resize_with(base.len().saturating_add(1), Vec::new);
+        // Slots: grafts landing before base[i] live in runs[i]; the
+        // final slot holds end-of-list grafts. Each branch's inserted
+        // runs are collected first so cross-branch dedupe can compare
+        // whole runs, then grafted A before B — within a shared slot
+        // A's insertions come first.
+        let slot_count = base.len().saturating_add(1);
+        let collect = |builder: &Self, branch, image: Option<NodeId>| match image {
+            Some(image) => builder.insert_runs(branch, image, &base_position, slot_count),
+            None => vec![Vec::new(); slot_count], // cov-excl-line: survivors have images in both branches.
+        };
+        let runs_a = collect(self, Branch::A, in_a);
+        let runs_b = collect(self, Branch::B, in_b);
+        let kept_b: Vec<Vec<NodeId>> = runs_a
+            .iter()
+            .zip(&runs_b)
+            .map(|(run_a, run_b)| self.dedupe_run(run_a, run_b))
+            .collect();
 
-        if let Some(ya) = in_a {
-            self.graft_branch(Branch::A, ya, &base_position, &mut slots);
-        }
-        if let Some(yb) = in_b {
-            self.graft_branch(Branch::B, yb, &base_position, &mut slots);
-        }
+        let graft_all = |builder: &mut Self, branch, runs: &[Vec<NodeId>]| -> Vec<Vec<MergedId>> {
+            runs.iter()
+                .map(|run| run.iter().map(|&n| builder.graft(branch, n)).collect())
+                .collect()
+        };
+        let grafted_a = graft_all(self, Branch::A, &runs_a);
+        let grafted_b = graft_all(self, Branch::B, &kept_b);
 
         // Materialize: slot grafts, then the base survivor they
-        // precede. Slots are sized base.len()+1, so the indexing below
+        // precede. Runs are sized base.len()+1, so the indexing below
         // stays in bounds.
         let mut children: Vec<MergedId> = Vec::new();
         #[allow(clippy::indexing_slicing)]
         for (i, &c) in base.iter().enumerate() {
-            children.extend(slots[i].iter().map(|entry| entry.id));
+            children.extend(&grafted_a[i]);
+            children.extend(&grafted_b[i]);
             if !self.consumed.contains(&c) {
                 children.push(self.build_survivor(c));
             }
         }
         #[allow(clippy::indexing_slicing)]
-        children.extend(slots[base.len()].iter().map(|entry| entry.id));
+        {
+            children.extend(&grafted_a[base.len()]);
+            children.extend(&grafted_b[base.len()]);
+        }
 
         self.push(MergedNode { origin, children })
     }
 
-    /// Walks one branch image's children, grafting insertions into the
-    /// slot after the nearest preceding child whose preimage sits in
-    /// the base.
-    ///
-    /// Dedupe is cross-branch only: a B insertion equal (by subtree
-    /// hash) to an A insertion in the same slot is the same edit made
-    /// twice and lands once, but one branch inserting two equal
-    /// subtrees is two real insertions. Each A entry can absorb at
-    /// most one B duplicate so multiplicities still add up.
-    fn graft_branch(
-        &mut self,
+    /// Walks one branch image's children, collecting insertions into
+    /// the slot after the nearest preceding child whose preimage sits
+    /// in the base.
+    fn insert_runs(
+        &self,
         branch: Branch,
         parent_image: NodeId,
         base_position: &HashMap<NodeId, usize>,
-        slots: &mut [Vec<SlotEntry>],
-    ) {
+        slot_count: usize,
+    ) -> Vec<Vec<NodeId>> {
         let (tree, matching) = match branch {
             Branch::A => (self.a, self.f),
             Branch::B => (self.b, self.g),
         };
+        let mut runs: Vec<Vec<NodeId>> = vec![Vec::new(); slot_count];
         let mut cursor = 0usize;
         for &child in tree.children(parent_image) {
             match matching.preimage(child) {
@@ -395,25 +398,65 @@ impl Builder<'_> {
                     }
                 }
                 None => {
-                    let hash = tree.hash(child);
-                    // Cursor is at most base.len(); slots has one more.
+                    // Cursor is at most base.len(); runs has one more.
                     #[allow(clippy::indexing_slicing)]
-                    let slot = &mut slots[cursor];
-                    if matches!(branch, Branch::B)
-                        && let Some(twin) = slot
-                            .iter_mut()
-                            .find(|entry| entry.dedupes_b && entry.hash == hash)
-                    {
-                        twin.dedupes_b = false;
-                        continue;
-                    }
-                    let id = self.graft(branch, child);
-                    slot.push(SlotEntry {
-                        hash,
-                        id,
-                        dedupes_b: matches!(branch, Branch::A),
-                    });
+                    runs[cursor].push(child);
                 }
+            }
+        }
+        runs
+    }
+
+    /// B's insertions in one slot that survive cross-branch dedupe
+    /// against A's. An equal run is the same edit made twice and lands
+    /// zero of B's nodes. Differing runs dedupe element-group-wise —
+    /// each A group absorbs at most one equal B group so
+    /// multiplicities still add up, and the groups B alone inserted
+    /// survive; this is what merges two branches' insertions under a
+    /// commutative parent. Runs that do not decompose into groups fall
+    /// back to per-node dedupe (equal separators must not absorb one
+    /// another mid-run, but such runs only co-occur in a slot when the
+    /// anchor was deleted, where per-node matching is the old, safe
+    /// behavior). Either way an equal run dedupes completely.
+    fn dedupe_run(&self, run_a: &[NodeId], run_b: &[NodeId]) -> Vec<NodeId> {
+        let hashes = |tree: &Tree, nodes: &[NodeId]| -> Vec<u64> {
+            nodes.iter().map(|&n| tree.hash(n)).collect()
+        };
+        match (
+            rules::element_groups(self.a, run_a),
+            rules::element_groups(self.b, run_b),
+        ) {
+            (Some(groups_a), Some(groups_b)) => {
+                let mut available: Vec<Vec<u64>> =
+                    groups_a.iter().map(|group| hashes(self.a, group)).collect();
+                let mut kept = Vec::new();
+                for group in groups_b {
+                    let group_hashes = hashes(self.b, &group);
+                    match available.iter().position(|twin| *twin == group_hashes) {
+                        Some(i) => {
+                            available.swap_remove(i);
+                        }
+                        None => kept.extend(group),
+                    }
+                }
+                kept
+            }
+            _ => {
+                let mut available = hashes(self.a, run_a);
+                run_b
+                    .iter()
+                    .copied()
+                    .filter(|&node| {
+                        let hash = self.b.hash(node);
+                        match available.iter().position(|&twin| twin == hash) {
+                            Some(i) => {
+                                available.swap_remove(i);
+                                false
+                            }
+                            None => true,
+                        }
+                    })
+                    .collect()
             }
         }
     }
@@ -1175,6 +1218,281 @@ mod tests {
             "fn f() { w(); x(); }",
             "fn f() { w(); x(); y(); }",
         )
+    }
+
+    #[test]
+    fn concurrent_insertions_under_a_commutative_parent_merge() -> Result<(), Error> {
+        // Both branches add a use declaration at the same slot; item
+        // order carries no meaning at the top level, so the runs merge
+        // as a union, A's first.
+        assert_merges(
+            "rust",
+            "use a;\nfn main() {}",
+            "use a;\nuse b;\nfn main() {}",
+            "use a;\nuse c;\nfn main() {}",
+            "use a;\nuse b;\nuse c;\nfn main() {}",
+        )?;
+        // The same for JSON object entries, where each run carries its
+        // separator: the commas travel with their pairs.
+        assert_merges(
+            "json",
+            r#"{"a": 1}"#,
+            r#"{"a": 1, "b": 2}"#,
+            r#"{"a": 1, "c": 3}"#,
+            r#"{"a": 1, "b": 2, "c": 3}"#,
+        )?;
+        // And for members of a Java class body.
+        assert_merges(
+            "java",
+            "class C { void a() { } }",
+            "class C { void a() { } void b() { } }",
+            "class C { void a() { } void c() { } }",
+            "class C { void a() { } void b() { } void c() { } }",
+        )
+    }
+
+    #[test]
+    fn bound_and_interface_lists_union_too() -> Result<(), Error> {
+        // Trait bounds and implements clauses are commutative: each
+        // branch's addition carries its separator, and order carries
+        // no meaning.
+        assert_merges(
+            "rust",
+            "fn f<T: Clone>() {}",
+            "fn f<T: Clone + Send>() {}",
+            "fn f<T: Clone + Sync>() {}",
+            "fn f<T: Clone + Send + Sync>() {}",
+        )?;
+        assert_merges(
+            "java",
+            "class C implements Foo { }",
+            "class C implements Foo, Bar { }",
+            "class C implements Foo, Baz { }",
+            "class C implements Foo, Bar, Baz { }",
+        )
+    }
+
+    #[test]
+    fn overlapping_commutative_insertions_dedupe_element_wise() -> Result<(), Error> {
+        // Both branches add `use c;`; each also adds its own. The
+        // shared element lands once, group-wise — its separator
+        // dedupes with it instead of being absorbed by an unrelated
+        // twin mid-run.
+        assert_merges(
+            "rust",
+            "use a;\nfn main() {}",
+            "use a;\nuse c;\nuse d;\nfn main() {}",
+            "use a;\nuse c;\nuse e;\nfn main() {}",
+            "use a;\nuse c;\nuse d;\nuse e;\nfn main() {}",
+        )?;
+        assert_merges(
+            "json",
+            r#"{"a": 1}"#,
+            r#"{"a": 1, "k": 9, "b": 2}"#,
+            r#"{"a": 1, "k": 9, "c": 3}"#,
+            r#"{"a": 1, "k": 9, "b": 2, "c": 3}"#,
+        )
+    }
+
+    #[test]
+    fn commutative_insertions_at_different_slots_merge() -> Result<(), Error> {
+        // No shared slot, nothing identical: both land where anchored.
+        // The comma each branch carries is a separator, not a
+        // duplicate element — duplicate-insert must stay silent.
+        assert_merges(
+            "json",
+            r#"{"a": 1, "z": 9}"#,
+            r#"{"a": 1, "b": 2, "z": 9}"#,
+            r#"{"a": 1, "z": 9, "c": 3}"#,
+            r#"{"a": 1, "b": 2, "z": 9, "c": 3}"#,
+        )
+    }
+
+    #[test]
+    fn same_named_commutative_insertions_at_one_slot_conflict() -> Result<(), Error> {
+        // Without name-collision covering the shared slot, the union
+        // merge would emit two `fn foo` definitions.
+        assert_conflicts(
+            "rust",
+            "fn main() {}",
+            "fn main() {}\nfn foo() { a(); }",
+            "fn main() {}\nfn foo() { b(); }",
+            "name-collision",
+        )?;
+        // Identical same-named insertions dedupe instead.
+        assert_merges(
+            "rust",
+            "fn main() {}",
+            "fn main() {}\nfn foo() { a(); }",
+            "fn main() {}\nfn foo() { a(); }",
+            "fn main() {}\nfn foo() { a(); }",
+        )
+    }
+
+    #[test]
+    fn an_attributed_insertion_unions_as_one_element() -> Result<(), Error> {
+        // A's attribute travels with the function it governs, so the
+        // union keeps them adjacent and B's insertion lands after.
+        assert_merges(
+            "rust",
+            "mod m {\n    pub fn run() {}\n}\n",
+            "mod m {\n    #[inline]\n    pub fn setup() {}\n\n    pub fn run() {}\n}\n",
+            "mod m {\n    pub fn teardown() {}\n\n    pub fn run() {}\n}\n",
+            "mod m {\n    #[inline]\n    pub fn setup() {}\n\n    pub fn teardown() {}\n\n    pub fn run() {}\n}\n",
+        )
+    }
+
+    #[test]
+    fn a_trailing_attribute_blocks_the_union() -> Result<(), Error> {
+        // A attributes the *surviving* function below the slot, so its
+        // inserted run ends with the attribute; splicing B's insertion
+        // in between would silently move the attribute onto B's code.
+        assert_conflicts(
+            "rust",
+            "mod m {\n    pub fn run() {}\n}\n",
+            "mod m {\n    pub fn setup() {}\n\n    #[cfg(test)]\n    pub fn run() {}\n}\n",
+            "mod m {\n    pub fn teardown() {}\n\n    pub fn run() {}\n}\n",
+            "insert-insert",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_attributed_and_a_bare_insertion_of_one_name_conflict() -> Result<(), Error> {
+        // The named nodes hash equal but the element groups differ, so
+        // the builder would land both copies; name-collision must
+        // compare groups, not names alone.
+        assert_conflicts(
+            "rust",
+            "fn main() {}\n",
+            "fn main() {}\n#[inline]\nfn helper() {}\n",
+            "fn main() {}\nfn helper() {}\n",
+            "name-collision",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn identical_nameless_insertions_at_different_slots_conflict() -> Result<(), Error> {
+        // Use declarations carry no name field, so name-collision is
+        // blind to them; without duplicate-insert the union would land
+        // `use c;` twice — a compile error neither branch wrote.
+        assert_conflicts(
+            "rust",
+            "use a;\nuse b;\n\nfn main() {}\n",
+            "use c;\nuse a;\nuse b;\n\nfn main() {}\n",
+            "use a;\nuse b;\nuse c;\n\nfn main() {}\n",
+            "duplicate-insert",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn commutative_insertions_with_trailing_separators_conflict() -> Result<(), Error> {
+        // Prepending into an object leaves each run's comma trailing
+        // (`"b": 2` then `,`); a union would need a separator neither
+        // branch wrote, so this stays an insert-insert conflict.
+        assert_conflicts(
+            "json",
+            r#"{"z": 0}"#,
+            r#"{"b": 2, "z": 0}"#,
+            r#"{"c": 3, "z": 0}"#,
+            "insert-insert",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn ungroupable_runs_fall_back_to_per_node_dedupe() -> Result<(), Error> {
+        // dedupe_run's fallback, driven directly: no rule-clean merge
+        // reaches it without a slot-anchor mismatch between the rules
+        // and the builder. A run ending in a separator cannot group;
+        // per-node matching still dedupes B's comma against A's and
+        // keeps the value A never inserted.
+        let o = parse("[1]", "json")?;
+        let a = parse("[1, 2]", "json")?;
+        let b = parse("[1, 3]", "json")?;
+        let f = diff(&o, &a);
+        let g = diff(&o, &b);
+        let builder = Builder {
+            o: &o,
+            a: &a,
+            b: &b,
+            f: &f,
+            g: &g,
+            nodes: Vec::new(),
+            placed: HashSet::new(),
+            consumed: HashSet::new(),
+        };
+        let comma_and = |tree: &Tree, digit: &str| -> Vec<NodeId> {
+            let comma = tree.nodes().find(|&n| tree.kind(n) == ",");
+            let value = tree.nodes().find(|&n| tree.label(n) == Some(digit));
+            match (comma, value) {
+                (Some(comma), Some(value)) => vec![comma, value],
+                _ => panic!("array literal parses"),
+            }
+        };
+        // A's run is comma-only (ungroupable); B's comma dedupes
+        // against it per-node and B's value survives.
+        let run_a: Vec<NodeId> = comma_and(&a, "2").first().copied().into_iter().collect();
+        let run_b = comma_and(&b, "3");
+        let kept = builder.dedupe_run(&run_a, &run_b);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.first().map(|&n| b.label(n)), Some(Some("3")));
+        Ok(())
+    }
+
+    #[test]
+    fn element_groups_split_on_named_nodes() -> Result<(), Error> {
+        // A run of [comma value comma value] groups pairwise; a run
+        // with a trailing separator does not group at all.
+        let tree = parse("[1, 2, 3]", "json")?;
+        let array = tree
+            .nodes()
+            .find(|&n| tree.kind(n) == "array")
+            .unwrap_or(tree.root());
+        let children = tree.children(array);
+        // children: [ 1 , 2 , 3 ] — drop the brackets.
+        let interior = children
+            .get(1..children.len().saturating_sub(1))
+            .unwrap_or(&[]);
+        let groups = crate::rules::element_groups(&tree, interior);
+        assert_eq!(
+            groups.as_ref().map(Vec::len),
+            Some(3),
+            "1 | ,2 | ,3: {groups:?}"
+        );
+        // Trailing comma (no closing element) refuses to group.
+        let trailing = children
+            .get(1..children.len().saturating_sub(2))
+            .unwrap_or(&[]);
+        assert_eq!(crate::rules::element_groups(&tree, trailing), None);
+        Ok(())
+    }
+
+    #[test]
+    fn element_groups_attach_attributes_to_the_next_item() -> Result<(), Error> {
+        // An attribute is a forward-binding prefix: it joins the
+        // following item's group, and a run it ends refuses to group.
+        let tree = parse("#[inline]\nfn f() {}\nfn g() {}", "rust")?;
+        let children = tree.children(tree.root());
+        // [attribute_item, function_item, function_item]
+        let groups = crate::rules::element_groups(&tree, children);
+        assert_eq!(
+            groups.as_ref().map(Vec::len),
+            Some(2),
+            "attr+f | g: {groups:?}"
+        );
+        assert_eq!(
+            groups.as_ref().and_then(|g| g.first()).map(Vec::len),
+            Some(2)
+        );
+        // A run ending in the attribute (its target elsewhere) refuses
+        // to group.
+        let mut trailing: Vec<NodeId> = children.get(1..).unwrap_or(&[]).to_vec();
+        trailing.extend(children.first());
+        assert_eq!(crate::rules::element_groups(&tree, &trailing), None);
+        Ok(())
     }
 
     #[test]

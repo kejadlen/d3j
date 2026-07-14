@@ -270,6 +270,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reformat_only_branch_keeps_its_layout_around_the_other_branchs_edit() -> Result<(), Error>
+    {
+        // A pretty-prints without touching the tree; B bumps a value.
+        // The reformat preference emits A's layout with B's edit
+        // spliced in, instead of B's single-line bytes.
+        let o = r#"{"name": "d3j", "version": 1, "debug": false}"#;
+        let a = "{\n  \"name\": \"d3j\",\n  \"version\": 1,\n  \"debug\": false\n}\n";
+        let b = r#"{"name": "d3j", "version": 2, "debug": false}"#;
+        let text = merge_text("json", o, a, b)?;
+        assert_eq!(
+            text,
+            "{\n  \"name\": \"d3j\",\n  \"version\": 2,\n  \"debug\": false\n}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn doc_comments_travel_with_grafted_functions() -> Result<(), Error> {
         let o = "fn keep() {\n    x();\n}\n";
         let a = "/// From A.\nfn top() {}\n\nfn keep() {\n    x();\n}\n";

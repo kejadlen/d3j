@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use crate::diff::{Matching, Shape, diff, edits};
+use crate::diff::{Edit, Matching, Shape, diff, edits};
 use crate::error::Error;
 use crate::rules;
 use crate::tree::{NodeId, Tree};
@@ -207,7 +207,9 @@ pub fn merge(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeOutcome, Error> {
         f: &f,
         g: &g,
     };
-    let conflicts = rules::conflicts(&ctx, &edits(o, a, &f), &edits(o, b, &g));
+    let edits_a = edits(o, a, &f);
+    let edits_b = edits(o, b, &g);
+    let conflicts = rules::conflicts(&ctx, &edits_a, &edits_b);
     if !conflicts.is_empty() {
         return Ok(MergeOutcome::Conflicts(conflicts));
     }
@@ -223,7 +225,7 @@ pub fn merge(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeOutcome, Error> {
         consumed: HashSet::new(),
     };
     let root = builder.build_survivor(o.root());
-    let merged = MergedTree {
+    let mut merged = MergedTree {
         nodes: builder.nodes,
         root,
     };
@@ -235,7 +237,47 @@ pub fn merge(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeOutcome, Error> {
         return Ok(MergeOutcome::Conflicts(arity_conflicts));
     }
 
+    prefer_reformatted_origins(&mut merged, o, (a, &f, &edits_a), (b, &g, &edits_b));
+
     Ok(MergeOutcome::Merged(merged))
+}
+
+/// Adopts a reformat-only branch's layout. A branch that only changed
+/// trivia is invisible to the pushout — its tree is isomorphic to O —
+/// so every survivor keeps its O origin and synthesis emits O's stale
+/// formatting, silently discarding the reformat. Remapping surviving
+/// O origins to that branch's image makes synthesis emit the
+/// reformatted bytes instead. When both branches are edit-free, A
+/// wins if it reformatted at all: span synthesis cannot honor two
+/// different reformats of the same code at once.
+fn prefer_reformatted_origins(
+    merged: &mut MergedTree,
+    o: &Tree,
+    a: (&Tree, &Matching, &[Edit]),
+    b: (&Tree, &Matching, &[Edit]),
+) {
+    fn text(tree: &Tree) -> Option<&str> {
+        tree.source_slice(0..tree.source_len())
+    }
+    let reformatted = |(branch, _, edits): (&Tree, &Matching, &[Edit])| {
+        edits.is_empty() && text(branch) != text(o)
+    };
+    let (matching, tag): (&Matching, fn(NodeId) -> Origin) = if reformatted(a) {
+        (a.1, Origin::A)
+    } else if reformatted(b) {
+        (b.1, Origin::B)
+    } else {
+        return;
+    };
+    for node in &mut merged.nodes {
+        // An empty edit script means the matching is total, so every
+        // surviving O node has an image to adopt.
+        if let Origin::O(n) = node.origin
+            && let Some(image) = matching.image(n)
+        {
+            node.origin = tag(image);
+        }
+    }
 }
 
 /// Which branch a graft comes from, with its diff to O and to-M pull
@@ -512,17 +554,34 @@ mod tests {
     }
 
     #[test]
-    fn reformatting_only_branches_leave_bytes_alone() -> Result<(), Error> {
-        // B reformats without changing the tree, so no relabel fires,
-        // every survivor keeps its O origin, and the output is
-        // byte-identical to O.
+    fn a_reformatting_only_branch_wins_the_bytes() -> Result<(), Error> {
+        // B reformats without changing the tree, so no relabel fires;
+        // the reformat preference adopts B's layout instead of
+        // silently discarding it with O's stale bytes.
         let o_text = "fn keep() {\n    x(y);\n}\n";
         let b_text = "fn keep(  ) {  x( y ) ;  }\n";
         let o = parse(o_text, "rust")?;
         let a = parse(o_text, "rust")?;
         let b = parse(b_text, "rust")?;
         match merge_to_text(&o, &a, &b)? {
-            MergeResult::Merged(text) => assert_eq!(text, o_text),
+            MergeResult::Merged(text) => assert_eq!(text, b_text),
+            MergeResult::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_distinct_reformats_prefer_a() -> Result<(), Error> {
+        // Span synthesis cannot honor two reformats of the same code
+        // at once; the tie breaks to A.
+        let o_text = "fn keep() {\n    x(y);\n}\n";
+        let a_text = "fn keep() { x(y); }\n";
+        let b_text = "fn keep(  ) {  x( y ) ;  }\n";
+        let o = parse(o_text, "rust")?;
+        let a = parse(a_text, "rust")?;
+        let b = parse(b_text, "rust")?;
+        match merge_to_text(&o, &a, &b)? {
+            MergeResult::Merged(text) => assert_eq!(text, a_text),
             MergeResult::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
         }
         Ok(())

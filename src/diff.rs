@@ -200,6 +200,132 @@ pub fn anchor(src: &Tree, dst: &Tree) -> Matching {
     m
 }
 
+/// Diff phase 2: top-down recursive alignment from the root pair.
+///
+/// For each matched pair, the child sequences align in two LCS passes
+/// per gap between fixed points (children phase 1 already matched):
+/// first keyed on subtree hash (exact-equal subtrees match wholesale),
+/// then keyed on (kind, label) — which pairs same-kind interior nodes to
+/// recurse into, but never labeled leaves whose text differs. Those stay
+/// unmatched: whether a 2/6 pair is a relabel or a delete+insert is
+/// phase 3's call, made under Zhang–Shasha's cost model.
+pub fn align(src: &Tree, dst: &Tree, m: &mut Matching) {
+    // O, A, and B always share a language, and these grammars use their
+    // root kind nowhere else, so root pairing is unconditional.
+    debug_assert_eq!(src.kind_id(src.root()), dst.kind_id(dst.root()));
+    m.insert(src.root(), dst.root());
+
+    let mut work = vec![(src.root(), dst.root())];
+    while let Some((x, y)) = work.pop() {
+        for (gap_x, gap_y) in gaps(m, src.children(x), dst.children(y)) {
+            let kx: Vec<u64> = gap_x.iter().map(|&n| src.hash(n)).collect();
+            let ky: Vec<u64> = gap_y.iter().map(|&n| dst.hash(n)).collect();
+            for (i, j) in lcs_pairs(&kx, &ky) {
+                // In-bounds: lcs_pairs only yields indices into its inputs.
+                #[allow(clippy::indexing_slicing)]
+                let (cx, cy) = (gap_x[i], gap_y[j]);
+                // Same collision guard as anchoring: equal hashes are
+                // trusted only after a structural check.
+                if structural_eq(src, cx, dst, cy) {
+                    match_subtree(m, src, cx, dst, cy);
+                }
+            }
+        }
+        // The hash pass narrowed the gaps; recompute them before the
+        // same-kind pass so its matches cannot cross a hash match.
+        for (gap_x, gap_y) in gaps(m, src.children(x), dst.children(y)) {
+            let kx: Vec<(u16, Option<&str>)> = gap_x
+                .iter()
+                .map(|&n| (src.kind_id(n), src.label(n)))
+                .collect();
+            let ky: Vec<(u16, Option<&str>)> = gap_y
+                .iter()
+                .map(|&n| (dst.kind_id(n), dst.label(n)))
+                .collect();
+            for (i, j) in lcs_pairs(&kx, &ky) {
+                #[allow(clippy::indexing_slicing)]
+                let (cx, cy) = (gap_x[i], gap_y[j]);
+                m.insert(cx, cy);
+                work.push((cx, cy));
+            }
+        }
+    }
+}
+
+/// Splits two child sequences into alignable gaps between fixed points —
+/// `xs` children whose image lies in `ys`. Children matched elsewhere
+/// (into another part of the tree) are excluded from alignment entirely.
+fn gaps(m: &Matching, xs: &[NodeId], ys: &[NodeId]) -> Vec<(Vec<NodeId>, Vec<NodeId>)> {
+    let ypos: HashMap<NodeId, usize> = ys.iter().enumerate().map(|(i, &y)| (y, i)).collect();
+    let unmatched_ys = |range: std::ops::Range<usize>| -> Vec<NodeId> {
+        ys.get(range)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|&y| m.preimage(y).is_none())
+            .collect()
+    };
+
+    let mut out = Vec::new();
+    let mut gap_x: Vec<NodeId> = Vec::new();
+    let mut y_start = 0usize;
+    for &xi in xs {
+        match m.image(xi) {
+            Some(image) => {
+                if let Some(&pos) = ypos.get(&image) {
+                    // Sibling order makes fixed-point positions
+                    // increase; the max() guards match anyway so a
+                    // violation cannot produce a crossing alignment.
+                    out.push((
+                        std::mem::take(&mut gap_x),
+                        unmatched_ys(y_start..pos.max(y_start)),
+                    ));
+                    y_start = y_start.max(pos.saturating_add(1));
+                }
+            }
+            None => gap_x.push(xi),
+        }
+    }
+    out.push((std::mem::take(&mut gap_x), unmatched_ys(y_start..ys.len())));
+    out
+}
+
+/// Longest common subsequence over two key sequences, as index pairs in
+/// increasing order on both sides.
+fn lcs_pairs<K: PartialEq>(xs: &[K], ys: &[K]) -> Vec<(usize, usize)> {
+    // Textbook suffix-length DP. Indices stay within the table, which
+    // is sized (n+1)×(m+1), and child-sequence lengths are nowhere near
+    // usize overflow.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    {
+        let (n, m) = (xs.len(), ys.len());
+        let mut table = vec![vec![0usize; m + 1]; n + 1];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                table[i][j] = if xs[i] == ys[j] {
+                    table[i + 1][j + 1] + 1
+                } else {
+                    table[i + 1][j].max(table[i][j + 1])
+                };
+            }
+        }
+        let mut pairs = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < n && j < m {
+            if xs[i] == ys[j] && table[i][j] == table[i + 1][j + 1] + 1 {
+                pairs.push((i, j));
+                i += 1;
+                j += 1;
+            } else if table[i + 1][j] >= table[i][j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        pairs
+    }
+}
+
 /// Maps each subtree hash to its node when it occurs exactly once, or
 /// `None` when duplicated.
 fn unique_subtrees(tree: &Tree) -> HashMap<u64, Option<NodeId>> {
@@ -484,6 +610,79 @@ mod tests {
         let m = anchor(&o, &a);
         assert!(m.validate(&o, &a).is_ok());
         assert!(m.pairs().all(|(s, _)| o.kind(s) != "number"));
+        Ok(())
+    }
+
+    fn phase12(o: &Tree, a: &Tree) -> Matching {
+        let mut m = anchor(o, a);
+        align(o, a, &mut m);
+        m
+    }
+
+    #[test]
+    fn alignment_matches_structure_around_insertions() -> Result<(), Error> {
+        // The paper's Figure 2: [1,2,3] → [1,2,4,5,3].
+        let o = parse_json("[1, 2, 3]")?;
+        let a = parse_json("[1, 2, 4, 5, 3]")?;
+        let m = phase12(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        assert_eq!(m.image(o.root()), Some(a.root()));
+        let arrays_matched = find_kind(&o, "array")
+            .first()
+            .and_then(|&arr| m.image(arr))
+            .map(|img| a.kind(img));
+        assert_eq!(arrays_matched, Some("array"));
+        for label in ["1", "2", "3"] {
+            let image_label = find_number(&o, label)
+                .and_then(|s| m.image(s))
+                .and_then(|d| a.label(d));
+            assert_eq!(image_label, Some(label));
+        }
+        for label in ["4", "5"] {
+            let preimage = find_number(&a, label).and_then(|d| m.preimage(d));
+            assert_eq!(preimage, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alignment_leaves_replaced_leaves_unmatched() -> Result<(), Error> {
+        // The paper's Figure 3: [1,2,3] → [1,6,3]. The 2/6 pair differs
+        // in label, so phase 2 leaves both unmatched — whether that is
+        // a relabel or a delete+insert is phase 3's call.
+        let o = parse_json("[1, 2, 3]")?;
+        let a = parse_json("[1, 6, 3]")?;
+        let m = phase12(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        assert_eq!(m.image(o.root()), Some(a.root()));
+        for label in ["1", "3"] {
+            let image_label = find_number(&o, label)
+                .and_then(|s| m.image(s))
+                .and_then(|d| a.label(d));
+            assert_eq!(image_label, Some(label));
+        }
+        assert_eq!(find_number(&o, "2").and_then(|s| m.image(s)), None);
+        assert_eq!(find_number(&a, "6").and_then(|d| m.preimage(d)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn alignment_exposes_renames_as_relabel_candidates() -> Result<(), Error> {
+        // Same-kind alignment matches the function_item wrapper, so the
+        // differing identifiers become phase 3's relabel candidates.
+        let o = parse_rust("fn a() {}")?;
+        let a = parse_rust("fn b() {}")?;
+        let m = phase12(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        let item_matched = find_kind(&o, "function_item")
+            .first()
+            .and_then(|&f| m.image(f))
+            .map(|img| a.kind(img));
+        assert_eq!(item_matched, Some("function_item"));
+        let o_ident = o.nodes().find(|&n| o.label(n) == Some("a"));
+        let a_ident = a.nodes().find(|&n| a.label(n) == Some("b"));
+        assert_eq!(o_ident.and_then(|n| m.image(n)), None);
+        assert_eq!(a_ident.and_then(|n| m.preimage(n)), None);
         Ok(())
     }
 

@@ -246,10 +246,172 @@ pub fn align(src: &Tree, dst: &Tree, m: &mut Matching) {
             for (i, j) in lcs_pairs(&kx, &ky) {
                 #[allow(clippy::indexing_slicing)]
                 let (cx, cy) = (gap_x[i], gap_y[j]);
+                // A same-kind pair that contradicts the anchors around
+                // it (a duplicate's twin holding them, say) would break
+                // the invariants — demote it; phase 3 gets another look
+                // at the residue.
+                if !admissible(src, dst, m, cx, cy) {
+                    continue;
+                }
                 m.insert(cx, cy);
                 work.push((cx, cy));
             }
         }
+    }
+}
+
+/// Runs all three diff phases: hash anchors, recursive alignment, and
+/// bounded Zhang–Shasha on the residues.
+pub fn diff(o: &Tree, a: &Tree) -> Matching {
+    let mut m = anchor(o, a);
+    align(o, a, &mut m);
+    refine(o, a, &mut m);
+    m
+}
+
+/// One edit in the script derived from a matching. The matching is the
+/// first-class object; this is a view of its holes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    /// A src node with no image.
+    Delete(NodeId),
+    /// A dst node with no preimage.
+    Insert(NodeId),
+    /// A matched pair whose labels differ.
+    Relabel(NodeId, NodeId),
+}
+
+/// Derives the edit script from a matching: deletes in src pre-order,
+/// then inserts in dst pre-order, then relabels.
+pub fn edits(o: &Tree, a: &Tree, m: &Matching) -> Vec<Edit> {
+    let mut script = Vec::new();
+    script.extend(
+        o.nodes()
+            .filter(|&n| m.image(n).is_none())
+            .map(Edit::Delete),
+    );
+    script.extend(
+        a.nodes()
+            .filter(|&n| m.preimage(n).is_none())
+            .map(Edit::Insert),
+    );
+    script.extend(
+        m.pairs()
+            .filter(|&(s, d)| o.label(s) != a.label(d))
+            .map(|(s, d)| Edit::Relabel(s, d)),
+    );
+    script
+}
+
+/// A tree reduced to what structural equality means here: kinds,
+/// labels, and shape — spans excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    pub kind_id: u16,
+    pub label: Option<String>,
+    pub children: Vec<Shape>,
+}
+
+impl Shape {
+    /// The shape of a parsed tree.
+    pub fn of(tree: &Tree) -> Self {
+        Self::of_node(tree, tree.root())
+    }
+
+    fn of_node(tree: &Tree, node: NodeId) -> Self {
+        Self {
+            kind_id: tree.kind_id(node),
+            label: tree.label(node).map(String::from),
+            children: tree
+                .children(node)
+                .iter()
+                .map(|&child| Self::of_node(tree, child))
+                .collect(),
+        }
+    }
+}
+
+/// Applies an edit script to `o`, reconstructing the destination shape.
+///
+/// A test oracle for the round-trip property, kept in the library
+/// because the merge pushout reuses the same grafting shape: survivors
+/// contribute kind and label from the src side (relabels rewrite them),
+/// inserts contribute whole dst subtrees, and placement is read from
+/// the dst tree's (parent-image, sibling-index) positions. The oracle
+/// asserts the script is exactly the matching's holes as it goes, so a
+/// diff that drops or invents an edit fails here rather than comparing
+/// equal by accident.
+pub fn apply(o: &Tree, a: &Tree, m: &Matching, script: &[Edit]) -> Shape {
+    let mut deletes: Vec<NodeId> = Vec::new();
+    let mut inserts: Vec<NodeId> = Vec::new();
+    let mut relabels: HashMap<NodeId, NodeId> = HashMap::new();
+    for edit in script {
+        match *edit {
+            Edit::Delete(n) => deletes.push(n),
+            Edit::Insert(n) => inserts.push(n),
+            Edit::Relabel(s, d) => {
+                relabels.insert(s, d);
+            }
+        }
+    }
+    assert!(
+        deletes.iter().all(|&n| m.image(n).is_none()),
+        "a delete names a matched src node"
+    );
+    assert!(
+        inserts.iter().all(|&n| m.preimage(n).is_none()),
+        "an insert names a matched dst node"
+    );
+    let survivors = o.nodes().filter(|&n| m.image(n).is_some()).count();
+    assert_eq!(
+        survivors.saturating_add(deletes.len()),
+        o.nodes().count(),
+        "deletes must cover exactly the unmatched src nodes"
+    );
+    assert_eq!(
+        survivors.saturating_add(inserts.len()),
+        a.nodes().count(),
+        "inserts must cover exactly the unmatched dst nodes"
+    );
+
+    build(o, a, m, &relabels, &inserts, a.root())
+}
+
+/// Builds the reconstructed shape for the dst position `node`: from the
+/// matched src node's kind and label when one exists, from the dst
+/// insert otherwise.
+fn build(
+    o: &Tree,
+    a: &Tree,
+    m: &Matching,
+    relabels: &HashMap<NodeId, NodeId>,
+    inserts: &[NodeId],
+    node: NodeId,
+) -> Shape {
+    let (kind_id, label) = match m.preimage(node) {
+        Some(src) => {
+            let label = match relabels.get(&src) {
+                Some(&target) => a.label(target).map(String::from),
+                None => o.label(src).map(String::from),
+            };
+            (o.kind_id(src), label)
+        }
+        None => {
+            assert!(
+                inserts.contains(&node),
+                "an unmatched dst node has no insert edit"
+            );
+            (a.kind_id(node), a.label(node).map(String::from))
+        }
+    };
+    Shape {
+        kind_id,
+        label,
+        children: a
+            .children(node)
+            .iter()
+            .map(|&child| build(o, a, m, relabels, inserts, child))
+            .collect(),
     }
 }
 
@@ -310,7 +472,13 @@ pub fn refine(src: &Tree, dst: &Tree, m: &mut Matching) {
             });
             for (s, d) in mapped {
                 if let (Some(x), Some(y)) = (s, d) {
-                    m.insert(x, y);
+                    // The forests were pruned of matched descendants,
+                    // so ZS cannot see anchors that pin x (or y)
+                    // elsewhere; demote pairs that would break the
+                    // invariants around them.
+                    if admissible(src, dst, m, x, y) {
+                        m.insert(x, y);
+                    }
                 }
             }
         }
@@ -498,6 +666,67 @@ fn match_subtree(m: &mut Matching, src: &Tree, s: NodeId, dst: &Tree, d: NodeId)
                 .zip(dst.children(y).iter().copied()),
         );
     }
+}
+
+/// Whether pairing `cx` with `cy` keeps the matching's invariants
+/// intact around nodes that are already matched. Two ways a candidate
+/// can break them, both found by the round-trip property on duplicated
+/// JSON keys:
+///
+/// - ancestry: a matched descendant of `cx` whose image lies outside
+///   `cy` (or vice versa) — pairing onto a duplicate whose twin holds
+///   the anchored descendants;
+/// - sibling order: a matched sibling of `cx` whose image falls on the
+///   wrong side of `cy` in document order (or vice versa) — pairing
+///   deep residue nodes around an anchor "hole" the pruned forests
+///   cannot see.
+fn admissible(src: &Tree, dst: &Tree, m: &Matching, cx: NodeId, cy: NodeId) -> bool {
+    let mut stack: Vec<NodeId> = src.children(cx).to_vec();
+    while let Some(w) = stack.pop() {
+        if let Some(z) = m.image(w)
+            && !is_ancestor(dst, cy, z)
+        {
+            return false;
+        }
+        stack.extend(src.children(w));
+    }
+    let mut stack: Vec<NodeId> = dst.children(cy).to_vec();
+    while let Some(z) = stack.pop() {
+        if let Some(w) = m.preimage(z)
+            && !is_ancestor(src, cx, w)
+        {
+            return false;
+        }
+        stack.extend(dst.children(z));
+    }
+    sibling_order_holds(src, |n| m.image(n), cx, cy)
+        && sibling_order_holds(dst, |n| m.preimage(n), cy, cx)
+}
+
+/// Whether matching `x` to `y` keeps `x`'s matched siblings on the
+/// same side of `y` (by document order) as they are of `x`.
+fn sibling_order_holds(
+    tree: &Tree,
+    map: impl Fn(NodeId) -> Option<NodeId>,
+    x: NodeId,
+    y: NodeId,
+) -> bool {
+    let Some(parent) = tree.parent(x) else {
+        return true;
+    };
+    let mut before = true;
+    for &sibling in tree.children(parent) {
+        if sibling == x {
+            before = false;
+            continue;
+        }
+        if let Some(image) = map(sibling)
+            && (image.index() < y.index()) != before
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `ancestor` is a proper ancestor of `node`.
@@ -797,10 +1026,70 @@ mod tests {
     }
 
     fn phase123(o: &Tree, a: &Tree) -> Matching {
-        let mut m = anchor(o, a);
-        align(o, a, &mut m);
-        refine(o, a, &mut m);
-        m
+        diff(o, a)
+    }
+
+    #[test]
+    fn identical_trees_produce_zero_edits() -> Result<(), Error> {
+        let o = parse_json("[1, 2, 3]")?;
+        let a = parse_json("[1, 2, 3]")?;
+        let m = diff(&o, &a);
+        assert_eq!(edits(&o, &a, &m).len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rename_produces_exactly_one_relabel() -> Result<(), Error> {
+        let o = parse_rust("fn a() {}")?;
+        let a = parse_rust("fn b() {}")?;
+        let m = diff(&o, &a);
+        let script = edits(&o, &a, &m);
+        assert_eq!(script.len(), 1);
+        assert!(matches!(script.first(), Some(Edit::Relabel(_, _))));
+        Ok(())
+    }
+
+    #[test]
+    fn insertions_and_deletions_are_derived() -> Result<(), Error> {
+        let o = parse_json("[1, 3]")?;
+        let a = parse_json("[1, 2, 3]")?;
+        let m = diff(&o, &a);
+        let script = edits(&o, &a, &m);
+        // The number 2 and its separating comma arrive as inserts;
+        // nothing is deleted or relabeled.
+        assert!(script.iter().all(|e| matches!(e, Edit::Insert(_))));
+        let inserted_number = script.iter().any(|e| match e {
+            Edit::Insert(n) => a.label(*n) == Some("2"),
+            _ => false,
+        });
+        assert!(inserted_number);
+
+        let reversed = edits(&a, &o, &diff(&a, &o));
+        assert!(reversed.iter().all(|e| matches!(e, Edit::Delete(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_reconstructs_the_target_shape() -> Result<(), Error> {
+        let cases = [
+            ("[1, 2, 3]", "[1, 2, 4, 5, 3]"),
+            ("[1, 2, 3]", "[1, 6, 3]"),
+            ("[[1, 2], [1, 2]]", "[[[1, 2, 9]], [1, 2]]"),
+            ("[]", "[[[]]]"),
+        ];
+        for (src, dst) in cases {
+            let o = parse_json(src)?;
+            let a = parse_json(dst)?;
+            let m = diff(&o, &a);
+            let script = edits(&o, &a, &m);
+            assert_eq!(apply(&o, &a, &m, &script), Shape::of(&a), "{src} -> {dst}");
+        }
+        let o = parse_rust("fn a() { x(); }\nfn c() {}")?;
+        let a = parse_rust("fn b() { x(); y(); }")?;
+        let m = diff(&o, &a);
+        let script = edits(&o, &a, &m);
+        assert_eq!(apply(&o, &a, &m, &script), Shape::of(&a));
+        Ok(())
     }
 
     #[test]
@@ -852,6 +1141,26 @@ mod tests {
         assert!(m.validate(&o, &a).is_ok());
         let matched_numbers = m.pairs().filter(|&(s, _)| o.kind(s) == "number").count();
         assert_eq!(matched_numbers, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_object_pairs_do_not_invert_ancestry() -> Result<(), Error> {
+        // Found by the round-trip property: with "items" and "flag"
+        // duplicated, alignment's same-kind LCS used to match O's
+        // "nested" pair to A's second "items" pair even though the
+        // anchored "nested" string inside it maps into a different
+        // subtree — inverting ancestry.
+        let o = parse_json(
+            r#"{"name": 1, "items": [1, 2], "nested": {"flag": true, "values": ["a", "b"]}, "count": 10}"#,
+        )?;
+        let a = parse_json(
+            r#"{"name": 1, "items": [1, 2], "items": [1, 2], "nested": {"flag": true, "flag": true, "values": ["a", "b"]}, "count": 10}"#,
+        )?;
+        let m = diff(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        let script = edits(&o, &a, &m);
+        assert_eq!(apply(&o, &a, &m, &script), Shape::of(&a));
         Ok(())
     }
 

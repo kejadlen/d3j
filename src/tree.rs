@@ -18,6 +18,13 @@ impl NodeId {
     pub(crate) fn index(self) -> usize {
         self.0
     }
+
+    /// Rebuilds an id from a side-table index. The caller owes the
+    /// same care as with indexing: the index must have come from a
+    /// table sized for the tree the id will be used with.
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
 }
 
 /// An owned syntax tree lifted from a tree-sitter CST.

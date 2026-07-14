@@ -237,6 +237,16 @@ mod tests {
                 .iter()
                 .all(|v| matches!(v, Violation::MissedDeletion { .. }))
         );
+        // And symmetrically when B is the deleting branch (the node
+        // reaches M through A's route).
+        let report = check_json("[1, 2]", "[1, 2]", "[2]", "[1, 2]")?;
+        assert!(!report.violations.is_empty());
+        assert!(
+            report
+                .violations
+                .iter()
+                .all(|v| matches!(v, Violation::MissedDeletion { .. }))
+        );
         Ok(())
     }
 

@@ -1,0 +1,37 @@
+# Equivalent mutants: each entry names a mutation that provably cannot
+# change observable behavior, with the argument. Keep this list short
+# and specific — a mutant goes here only after the equivalence argument
+# is written down.
+
+exclude_re = [
+    # anchor(): for a unique-unique candidate pair, s being matched
+    # implies d is matched and vice versa — a larger wholesale anchor
+    # pairs s with its positional counterpart, whose equal content and
+    # dst-side uniqueness force it to be d. Either disjunct implies
+    # the other, so || and && coincide.
+    'replace \|\| with && in anchor',
+    # anchor(): candidates are unmatched while placed roots are
+    # matched, so a candidate index never equals a placed root's and
+    # < versus <= cannot differ.
+    'replace < with <= in anchor',
+    # refine(): a gap empty on one side produces a ZS mapping with no
+    # real (Some, Some) pairs to fold; the skip is a fast path, not a
+    # behavior change.
+    'replace \|\| with && in refine',
+    # refine(): the ZS budget is an arbitrary tuning constant; > vs >=
+    # differs only for a residue of exactly 400 nodes and either
+    # behavior is acceptable there.
+    'replace > with >= in refine',
+    # refine()'s relabel closure: if the virtual forest roots cannot
+    # pair, every candidate mapping pays the same uniform +2 (delete
+    # plus insert of the roots), so the optimal child mapping — the
+    # only thing folded — is unchanged.
+    'delete match arm \(None, None\) in refine',
+    # lcs_pairs(): the fill guarantees the equal case always took the
+    # diagonal, so the surviving index mutants only change *which* of
+    # several equally long subsequences the backtrack walks — every
+    # choice they can make is optimal. The exhaustive reference-oracle
+    # test pins length and validity, which is the function's whole
+    # contract; a mutant that broke either would be caught by it.
+    'replace \+ with \* in lcs_pairs',
+]

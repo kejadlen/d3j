@@ -1205,6 +1205,55 @@ mod tests {
         Ok(())
     }
 
+    /// Naive recursive LCS length, the oracle for the DP.
+    fn reference_lcs(xs: &[char], ys: &[char]) -> usize {
+        let (Some((x, x_rest)), Some((y, y_rest))) = (xs.split_first(), ys.split_first()) else {
+            return 0;
+        };
+        if x == y {
+            reference_lcs(x_rest, y_rest).saturating_add(1)
+        } else {
+            reference_lcs(x_rest, ys).max(reference_lcs(xs, y_rest))
+        }
+    }
+
+    /// All strings over {a, b, c} up to `depth` more characters.
+    fn all_strings(prefix: Vec<char>, depth: usize, out: &mut Vec<Vec<char>>) {
+        out.push(prefix.clone());
+        if depth == 0 {
+            return;
+        }
+        for c in ['a', 'b', 'c'] {
+            let mut next = prefix.clone();
+            next.push(c);
+            all_strings(next, depth.saturating_sub(1), out);
+        }
+    }
+
+    #[test]
+    fn lcs_pairs_matches_a_reference_on_all_small_inputs() {
+        // Exhaustive over both sides: the alignment tests alone
+        // under-constrain the DP because phase 3 rescues small cases,
+        // and hand-picked cases let index-arithmetic mutants slip
+        // through the backtrack's compensating paths.
+        let mut strings = Vec::new();
+        all_strings(Vec::new(), 4, &mut strings);
+        for xs in &strings {
+            for ys in &strings {
+                let pairs = lcs_pairs(xs, ys);
+                assert_eq!(pairs.len(), reference_lcs(xs, ys), "LCS({xs:?}, {ys:?})");
+                for (i, j) in &pairs {
+                    assert_eq!(xs.get(*i), ys.get(*j), "LCS({xs:?}, {ys:?})");
+                }
+                for window in pairs.windows(2) {
+                    if let [(i1, j1), (i2, j2)] = window {
+                        assert!(i1 < i2 && j1 < j2, "LCS({xs:?}, {ys:?}) crosses: {pairs:?}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn structural_eq_distinguishes_kind_label_and_shape() -> Result<(), Error> {
         // The collision guard in anchor() is unreachable through real

@@ -221,12 +221,7 @@ What landed:
 
 Remaining gaps the suite sweep exposed, in rough order of value:
 
-- Commutative-list merging. About half of the suite's clean-for-
-  mergiraf cases conflict in d3j: both branches adding imports, use
-  statements, or class members at the same slot is insert-insert for
-  d3j, while mergiraf's per-language "commutative parent" metadata
-  merges them (`use_statements`, `star_imports`, `module_members`,
-  `interface_list`, …).
+- ~~Commutative-list merging~~ — done, see the second update below.
 - Comment edits are invisible. `use crate::{foo, /* bar */}` vs
   `/* baz */`: comments are trivia, so d3j sees two identical
   comma-inserts, dedupes, and outputs `use crate::{foo,};` — both
@@ -245,3 +240,59 @@ After the fixes, d3j handles all 14 corpus scenarios correctly
 (mergiraf's clean merge on `move-loses-edit` is its move detection
 producing the ideal result — d3j stays conflict-safe there until move
 detection lands).
+
+## Second update: commutative-list merging
+
+Concurrent insertions at the same slot under a *commutative parent* —
+a node kind whose child order carries no meaning — now merge as a
+union instead of conflicting. Each language declares its kinds: Rust
+`source_file`, `declaration_list`, `use_list`, `trait_bounds`; Java
+`program`, `class_body`, `interface_body`, `type_list`, `throws`;
+JSON `object`. Both branches adding imports, use declarations, type
+members, trait bounds, implemented interfaces, or object keys next to
+each other now merges, A's insertions before B's.
+
+The construction leans on machinery that was already there: the
+builder always grafted A's then B's same-slot insertions with
+cross-branch dedupe — the insert-insert rule was the only blocker.
+What the union actually required:
+
+- Element groups. A branch's inserted run decomposes into elements: a
+  named node plus the anonymous separators before it (a JSON insert is
+  `, "k": v` — the comma travels with its pair) and any forward-binding
+  prefix (a Rust `#[attr]` travels with the item it governs). Dedupe
+  is now group-wise, so two branches both adding `use c;` alongside
+  their own additions share one copy without a stray comma absorbing
+  an unrelated twin. A run that does not decompose — a trailing
+  separator (prepending into an object), or a trailing attribute whose
+  target sits outside the run — refuses to union and conflicts as
+  before. The attribute case is real: mergiraf's `attributes` example
+  had A attributing the surviving function while B inserted above it,
+  and a naive union silently moved `#[cfg(...)]` onto B's code.
+- name-collision now covers the shared slot. Same-slot insertions of
+  one name used to be insert-insert's problem; in a union they merge,
+  so two different `fn foo` at one slot must conflict here. The rule
+  compares whole element groups — exactly what the builder dedupes —
+  so an attributed insertion stays distinct from a bare one.
+- A duplicate-insert rule. Identical *nameless* elements (use
+  declarations, imports) inserted by both branches at different slots
+  under a commutative parent would land twice — name-collision only
+  sees `name`/`key` fields. mergiraf dedupes these; d3j conflicts, to
+  stay consistent with its named-element behavior.
+- Fungible separators in the checker. With both branches contributing
+  a comma each, the self-check's independently derived matchings let
+  both claim the same merged comma, orphaning its twin as a bogus
+  "extra insertion". Anonymous tokens under commutative parents are
+  now exempt from the universality conditions: their attribution is
+  ambiguous by construction, and the parse itself pins how many the
+  output needs.
+
+On mergiraf's 54-case example suite this moves d3j from 24 correct
+outcomes to 33; conflicts-where-mergiraf-merges drop from 24 to 16.
+The survivors are mergiraf edges d3j does not model yet: derive
+arguments (the argument list is a macro `token_tree`, which cannot be
+blanket-commutative), identical elements inserted at different slots
+(d3j deliberately conflicts where mergiraf dedupes), move detection,
+comment attachment, and normalizing away a branch's insertion that
+duplicates something already in base (mergiraf drops it; d3j
+faithfully keeps the branch's edit).

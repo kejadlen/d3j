@@ -107,6 +107,94 @@ pub enum MergeOutcome {
     Conflicts(Vec<Conflict>),
 }
 
+/// A finished merge: the output text, or the conflicts that stopped it.
+#[derive(Debug)]
+pub enum MergeResult {
+    Merged(String),
+    Conflicts(Vec<Conflict>),
+}
+
+/// Merges A and B against O all the way to output text, self-checking
+/// the result before handing it over: the synthesized text must
+/// re-parse cleanly and the re-parsed tree must pass the universality
+/// checker against the inputs.
+///
+/// A self-check failure means a d3j bug, not a user problem — it is
+/// logged as an error and surfaced as a `self-check` pseudo-conflict
+/// so the user still gets a safe (conflicted) outcome instead of a
+/// silently wrong merge.
+pub fn merge_to_text(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeResult, Error> {
+    merge_to_text_with(o, a, b, crate::synth::synthesize)
+}
+
+/// [`merge_to_text`] with the synthesis step injectable, so tests can
+/// feed the guard defective output.
+fn merge_to_text_with(
+    o: &Tree,
+    a: &Tree,
+    b: &Tree,
+    synthesizer: impl Fn(&MergedTree, &Tree, &Tree, &Tree) -> String,
+) -> Result<MergeResult, Error> {
+    let merged = match merge(o, a, b)? {
+        MergeOutcome::Merged(merged) => merged,
+        MergeOutcome::Conflicts(conflicts) => return Ok(MergeResult::Conflicts(conflicts)),
+    };
+    let text = synthesizer(&merged, o, a, b);
+
+    let reparsed = match Tree::parse(&text, o.lang()) {
+        Ok(tree) => tree,
+        Err(_) => {
+            tracing::error!("self-check failed: synthesized merge does not re-parse");
+            return Ok(MergeResult::Conflicts(vec![Conflict {
+                span_o: None,
+                span_a: None,
+                span_b: None,
+                rule: "self-check",
+            }]));
+        }
+    };
+
+    let report = crate::check::check(o, a, b, &reparsed);
+    if !report.is_correct() {
+        tracing::error!(
+            violations = ?report.violations,
+            "self-check failed: merged output violates universality"
+        );
+        let conflicts = report
+            .violations
+            .iter()
+            .map(|violation| {
+                use crate::check::Violation;
+                let (span_o, span_a, span_b) = match violation {
+                    Violation::ExtraDeletion { span, .. }
+                    | Violation::MissedDeletion { span, .. } => (Some(span.clone()), None, None),
+                    Violation::MissedInsertion {
+                        branch: crate::check::Branch::A,
+                        span,
+                        ..
+                    } => (None, Some(span.clone()), None),
+                    Violation::MissedInsertion {
+                        branch: crate::check::Branch::B,
+                        span,
+                        ..
+                    } => (None, None, Some(span.clone())),
+                    // The witness lives in M, which has no span slot.
+                    Violation::ExtraInsertion { .. } => (None, None, None),
+                };
+                Conflict {
+                    span_o,
+                    span_a,
+                    span_b,
+                    rule: "self-check",
+                }
+            })
+            .collect();
+        return Ok(MergeResult::Conflicts(conflicts));
+    }
+
+    Ok(MergeResult::Merged(text))
+}
+
 /// Merges A and B against their common origin O.
 pub fn merge(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeOutcome, Error> {
     let f = diff(o, a);
@@ -531,6 +619,63 @@ mod tests {
             "fn a() { x(); }",
             "fn a() { x(); z(); }",
         )
+    }
+
+    #[test]
+    fn merge_to_text_passes_clean_scenarios() -> Result<(), Error> {
+        let o = parse("[1, 2, 3]", "json")?;
+        let a = parse("[1, 2, 4, 5, 3]", "json")?;
+        let b = parse("[1, 6, 3]", "json")?;
+        match merge_to_text(&o, &a, &b)? {
+            MergeResult::Merged(text) => {
+                let merged = parse(&text, "json")?;
+                let expected = parse("[1, 6, 4, 5, 3]", "json")?;
+                assert_eq!(Shape::of(&merged), Shape::of(&expected));
+            }
+            MergeResult::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merge_to_text_passes_conflicts_through() -> Result<(), Error> {
+        let o = parse("fn a() {}", "rust")?;
+        let a = parse("fn b() {}", "rust")?;
+        let b = parse("fn c() {}", "rust")?;
+        let MergeResult::Conflicts(conflicts) = merge_to_text(&o, &a, &b)? else {
+            panic!("expected conflicts");
+        };
+        assert!(conflicts.iter().any(|c| c.rule == "relabel-relabel"));
+        Ok(())
+    }
+
+    #[test]
+    fn unparsable_synthesis_becomes_a_self_check_conflict() -> Result<(), Error> {
+        let o = parse("[1, 2]", "json")?;
+        let a = parse("[1, 2, 3]", "json")?;
+        let b = parse("[1, 2]", "json")?;
+        let result = merge_to_text_with(&o, &a, &b, |_, _, _, _| "[1, 2,".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected a self-check conflict");
+        };
+        assert!(conflicts.iter().all(|c| c.rule == "self-check"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_dropped_node_becomes_a_self_check_conflict() -> Result<(), Error> {
+        let o = parse("[1, 2]", "json")?;
+        let a = parse("[1, 2, 3]", "json")?;
+        let b = parse("[1, 2]", "json")?;
+        // Parses fine but silently drops A's insertion; the
+        // universality re-check must catch it.
+        let result = merge_to_text_with(&o, &a, &b, |_, _, _, _| "[1, 2]".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected a self-check conflict");
+        };
+        assert!(!conflicts.is_empty());
+        assert!(conflicts.iter().all(|c| c.rule == "self-check"));
+        Ok(())
     }
 
     /// Clones O into a candidate MergedTree, skipping one node (and

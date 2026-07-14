@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::tree::{NodeId, Tree};
 
 /// A matching between two trees: the order-preserving partial inclusion
@@ -145,6 +147,123 @@ impl Matching {
     }
 }
 
+/// Diff phase 1: anchor subtrees whose hash occurs exactly once in each
+/// tree, largest first.
+///
+/// Every anchored subtree matches wholesale (all descendants pairwise).
+/// A candidate that would cross an already-placed anchor in document
+/// order is demoted — skipped, never an invariant violation. Processing
+/// largest-first means a candidate inside a placed anchor is already
+/// matched, so surviving anchor roots always head disjoint subtrees.
+pub fn anchor(src: &Tree, dst: &Tree) -> Matching {
+    let mut m = Matching::new(src, dst);
+    let src_sizes = subtree_sizes(src);
+    let src_unique = unique_subtrees(src);
+    let dst_unique = unique_subtrees(dst);
+
+    let mut candidates: Vec<(NodeId, NodeId)> = src_unique
+        .iter()
+        .filter_map(|(hash, &s)| {
+            let s = s?;
+            let d = dst_unique.get(hash).copied().flatten()?;
+            Some((s, d))
+        })
+        .collect();
+    candidates.sort_by_key(|&(s, _)| {
+        let size = src_sizes.get(s.index()).copied().unwrap_or(0);
+        (std::cmp::Reverse(size), s.index())
+    });
+
+    let mut placed: Vec<(NodeId, NodeId)> = Vec::new();
+    for (s, d) in candidates {
+        // Already inside a larger anchor's subtree on either side.
+        if m.image(s).is_some() || m.preimage(d).is_some() {
+            continue;
+        }
+        // Demote candidates that cross a placed anchor: disjoint
+        // subtrees must keep the same document order on both sides.
+        let crosses = placed
+            .iter()
+            .any(|&(x, y)| (x.index() < s.index()) != (y.index() < d.index()));
+        if crosses {
+            continue;
+        }
+        // Equal hashes virtually always mean equal structure, but a
+        // 64-bit collision would corrupt the matching; verify before
+        // committing the subtree.
+        if !structural_eq(src, s, dst, d) {
+            continue;
+        }
+        match_subtree(&mut m, src, s, dst, d);
+        placed.push((s, d));
+    }
+    m
+}
+
+/// Maps each subtree hash to its node when it occurs exactly once, or
+/// `None` when duplicated.
+fn unique_subtrees(tree: &Tree) -> HashMap<u64, Option<NodeId>> {
+    let mut map: HashMap<u64, Option<NodeId>> = HashMap::new();
+    for n in tree.nodes() {
+        map.entry(tree.hash(n))
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(n));
+    }
+    map
+}
+
+/// Node counts per subtree, indexed like the arena.
+fn subtree_sizes(tree: &Tree) -> Vec<usize> {
+    let ids: Vec<_> = tree.nodes().collect();
+    let mut sizes = vec![1usize; ids.len()];
+    // Reverse pre-order: children are summed before their parent reads.
+    for &id in ids.iter().rev() {
+        let total = tree
+            .children(id)
+            .iter()
+            .map(|child| sizes.get(child.index()).copied().unwrap_or(0))
+            .fold(1usize, usize::saturating_add);
+        if let Some(slot) = sizes.get_mut(id.index()) {
+            *slot = total;
+        }
+    }
+    sizes
+}
+
+/// Whether two subtrees are equal in kind, label, and shape.
+fn structural_eq(src: &Tree, s: NodeId, dst: &Tree, d: NodeId) -> bool {
+    let mut stack = vec![(s, d)];
+    while let Some((x, y)) = stack.pop() {
+        if src.kind_id(x) != dst.kind_id(y)
+            || src.label(x) != dst.label(y)
+            || src.children(x).len() != dst.children(y).len()
+        {
+            return false;
+        }
+        stack.extend(
+            src.children(x)
+                .iter()
+                .copied()
+                .zip(dst.children(y).iter().copied()),
+        );
+    }
+    true
+}
+
+/// Matches two structurally equal subtrees pairwise, top to bottom.
+fn match_subtree(m: &mut Matching, src: &Tree, s: NodeId, dst: &Tree, d: NodeId) {
+    let mut stack = vec![(s, d)];
+    while let Some((x, y)) = stack.pop() {
+        m.insert(x, y);
+        stack.extend(
+            src.children(x)
+                .iter()
+                .copied()
+                .zip(dst.children(y).iter().copied()),
+        );
+    }
+}
+
 /// Whether `ancestor` is a proper ancestor of `node`.
 fn is_ancestor(tree: &Tree, ancestor: NodeId, node: NodeId) -> bool {
     let mut up = tree.parent(node);
@@ -167,6 +286,13 @@ mod tests {
     fn parse_json(src: &str) -> Result<Tree, Error> {
         let lang = Lang::by_name("json").ok_or(Error::UnknownLanguage {
             path: "json".into(),
+        })?;
+        Tree::parse(src, lang)
+    }
+
+    fn parse_rust(src: &str) -> Result<Tree, Error> {
+        let lang = Lang::by_name("rust").ok_or(Error::UnknownLanguage {
+            path: "rust".into(),
         })?;
         Tree::parse(src, lang)
     }
@@ -297,6 +423,83 @@ mod tests {
         assert_eq!(m.image(o2), Some(a2));
         assert_eq!(m.image(o1), None);
         assert_eq!(m.preimage(a2), Some(o2));
+        Ok(())
+    }
+
+    #[test]
+    fn unique_subtrees_anchor() -> Result<(), Error> {
+        let o = parse_rust("fn a() {}\nfn b() {}")?;
+        let a = parse_rust("fn a() {}\nfn c() {}\nfn b() {}")?;
+        let m = anchor(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        // Both fn a and fn b anchor wholesale: the function_items match
+        // and so do the identifiers inside them.
+        let fns = m
+            .pairs()
+            .filter(|&(s, _)| o.kind(s) == "function_item")
+            .count();
+        assert_eq!(fns, 2);
+        let ids: Vec<_> = m
+            .pairs()
+            .filter(|&(s, _)| o.kind(s) == "identifier")
+            .map(|(s, d)| (o.label(s), a.label(d)))
+            .collect();
+        assert!(ids.contains(&(Some("a"), Some("a"))));
+        assert!(ids.contains(&(Some("b"), Some("b"))));
+        Ok(())
+    }
+
+    #[test]
+    fn crossing_anchors_are_demoted() -> Result<(), Error> {
+        // O = [a, b], A = [b, a]: whichever anchors second would cross
+        // the first, so it must be dropped, not create a crossing map.
+        let o = parse_rust("fn a() {}\nfn b() {}")?;
+        let a = parse_rust("fn b() {}\nfn a() {}")?;
+        let m = anchor(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        let fns = m
+            .pairs()
+            .filter(|&(s, _)| o.kind(s) == "function_item")
+            .count();
+        assert_eq!(fns, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_trees_anchor_wholesale_at_the_root() -> Result<(), Error> {
+        let o = parse_rust("fn a() { x(); }")?;
+        let a = parse_rust("fn a() { x(); }")?;
+        let m = anchor(&o, &a);
+        assert_eq!(m.pairs().count(), o.nodes().count());
+        assert!(m.validate(&o, &a).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_subtrees_do_not_anchor() -> Result<(), Error> {
+        // The number 1 appears twice in O, so its hash is not unique
+        // there and it must not anchor — even though it is unique in A.
+        let o = parse_json("[1, 1]")?;
+        let a = parse_json("[1]")?;
+        let m = anchor(&o, &a);
+        assert!(m.validate(&o, &a).is_ok());
+        assert!(m.pairs().all(|(s, _)| o.kind(s) != "number"));
+        Ok(())
+    }
+
+    #[test]
+    fn structural_eq_distinguishes_kind_label_and_shape() -> Result<(), Error> {
+        // The collision guard in anchor() is unreachable through real
+        // hashes, so its rejection paths are pinned directly here.
+        let one = parse_json("[1]")?;
+        let same = parse_json("[1]")?;
+        let two = parse_json("[2]")?;
+        let longer = parse_json("[1, 2]")?;
+        let object = parse_json("{}")?;
+        assert!(structural_eq(&one, one.root(), &same, same.root()));
+        assert!(!structural_eq(&one, one.root(), &two, two.root()));
+        assert!(!structural_eq(&one, one.root(), &longer, longer.root()));
+        assert!(!structural_eq(&one, one.root(), &object, object.root()));
         Ok(())
     }
 

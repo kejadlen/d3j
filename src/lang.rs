@@ -323,6 +323,28 @@ mod tests {
     }
 
     #[test]
+    fn admits_expands_nested_supertypes() {
+        // rust's block admits statements whose literals sit two
+        // supertype hops away (_expression → _literal → ...), so the
+        // expansion must survive visiting several supertype entries.
+        let node_types = Lang::by_name("rust").map(Lang::node_types);
+        let block_types = node_types
+            .and_then(|nt| nt.get("block"))
+            .and_then(|t| t.children.as_ref())
+            .map(|slot| slot.types.as_slice());
+        let admits = |kind: &str| {
+            node_types
+                .zip(block_types)
+                .is_some_and(|(nt, types)| nt.admits(types, kind))
+        };
+        assert!(admits("integer_literal"));
+        assert!(admits("string_literal"));
+        assert!(admits("expression_statement"));
+        assert!(!admits("no_such_kind"));
+        assert!(!admits("source_file"));
+    }
+
+    #[test]
     fn supertype_subtypes_are_loaded() {
         let has_const_item = Lang::by_name("rust").map(|lang| {
             lang.node_types()

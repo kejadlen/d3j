@@ -8,6 +8,7 @@
 //! between trees and related problems", SIAM J. Comput. 18(6), 1989.
 
 /// A tree for Zhang–Shasha: a value and ordered children.
+#[derive(Clone)]
 pub struct ZsTree<T> {
     pub value: T,
     pub children: Vec<ZsTree<T>>,
@@ -29,6 +30,17 @@ pub fn mapping<T: Copy>(
     dst: &ZsTree<T>,
     relabel: impl Fn(T, T) -> Option<u32>,
 ) -> Vec<(T, T)> {
+    mapping_with_cost(src, dst, relabel).0
+}
+
+/// [`mapping`] plus the optimal edit cost the DP computed, so tests
+/// can hold the backtrack to account: the mapping's implied cost must
+/// equal the distance.
+pub(crate) fn mapping_with_cost<T: Copy>(
+    src: &ZsTree<T>,
+    dst: &ZsTree<T>,
+    relabel: impl Fn(T, T) -> Option<u32>,
+) -> (Vec<(T, T)>, u32) {
     let src_flat = Flat::build(src);
     let dst_flat = Flat::build(dst);
     let solver = Solver {
@@ -103,7 +115,7 @@ struct Solver<T, F> {
 // waived for fidelity to the published pseudocode.
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 impl<T: Copy, F: Fn(T, T) -> Option<u32>> Solver<T, F> {
-    fn solve(&self) -> Vec<(T, T)> {
+    fn solve(&self) -> (Vec<(T, T)>, u32) {
         let (n, m) = (self.src.len(), self.dst.len());
         let mut treedist = vec![vec![0u32; m + 1]; n + 1];
         for &i in &self.src.keyroots {
@@ -111,6 +123,7 @@ impl<T: Copy, F: Fn(T, T) -> Option<u32>> Solver<T, F> {
                 self.forest_dist(i, j, &mut treedist);
             }
         }
+        let distance = treedist[n][m];
 
         // Backtrack: walk each subtree pair's forest table from the
         // corner, emitting pairs on diagonal steps that close a whole
@@ -137,7 +150,7 @@ impl<T: Copy, F: Fn(T, T) -> Option<u32>> Solver<T, F> {
                 }
             }
         }
-        pairs
+        (pairs, distance)
     }
 
     /// The forest-distance DP for the subtree pair (i, j), 1-based.
@@ -246,6 +259,94 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         for pair in [("f", "f"), ("b", "b")] {
             assert!(pairs.contains(&pair));
+        }
+    }
+
+    /// All trees with exactly `nodes` nodes over the given labels.
+    fn trees_with(nodes: usize, labels: &[u8]) -> Vec<ZsTree<u8>> {
+        if nodes == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &label in labels {
+            for children in forests(nodes.saturating_sub(1), labels) {
+                out.push(ZsTree {
+                    value: label,
+                    children,
+                });
+            }
+        }
+        out
+    }
+
+    /// All ordered forests totalling `total` nodes.
+    fn forests(total: usize, labels: &[u8]) -> Vec<Vec<ZsTree<u8>>> {
+        if total == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for first in 1..=total {
+            for head in trees_with(first, labels) {
+                for tail in forests(total.saturating_sub(first), labels) {
+                    let mut forest = vec![head.clone()];
+                    forest.extend(tail);
+                    out.push(forest);
+                }
+            }
+        }
+        out
+    }
+
+    /// Clones a label tree into an identity-carrying tree with
+    /// pre-order ids, returning the node count.
+    fn retag(tree: &ZsTree<u8>, next: &mut usize) -> ZsTree<(usize, u8)> {
+        let id = *next;
+        *next = next.saturating_add(1);
+        ZsTree {
+            value: (id, tree.value),
+            children: tree.children.iter().map(|c| retag(c, next)).collect(),
+        }
+    }
+
+    #[test]
+    fn mapping_cost_matches_the_dp_on_all_small_trees() {
+        // Exhaustive internal-consistency oracle: the backtracked
+        // mapping's implied cost (relabels + unmatched nodes on both
+        // sides) must equal the DP's optimal distance, and the mapping
+        // must be a bijection. Kills backtrack mutants that hand-picked
+        // cases let through.
+        let labels = [0u8, 1u8];
+        let mut all: Vec<(ZsTree<(usize, u8)>, usize)> = Vec::new();
+        for nodes in 1..=3usize {
+            for tree in trees_with(nodes, &labels) {
+                let mut next = 0usize;
+                let tagged = retag(&tree, &mut next);
+                all.push((tagged, next));
+            }
+        }
+        for (src, src_count) in &all {
+            for (dst, dst_count) in &all {
+                let (pairs, distance) =
+                    mapping_with_cost(src, dst, |a, b| if a.1 == b.1 { Some(0) } else { Some(1) });
+                let relabels = pairs.iter().filter(|(a, b)| a.1 != b.1).count();
+                let matched = pairs.len();
+                let implied = relabels
+                    .saturating_add(src_count.saturating_sub(matched))
+                    .saturating_add(dst_count.saturating_sub(matched));
+                assert_eq!(
+                    u32::try_from(implied).ok(),
+                    Some(distance),
+                    "implied cost diverged for {matched} pairs"
+                );
+                let mut src_ids: Vec<usize> = pairs.iter().map(|(a, _)| a.0).collect();
+                let mut dst_ids: Vec<usize> = pairs.iter().map(|(_, b)| b.0).collect();
+                src_ids.sort_unstable();
+                src_ids.dedup();
+                dst_ids.sort_unstable();
+                dst_ids.dedup();
+                assert_eq!(src_ids.len(), matched);
+                assert_eq!(dst_ids.len(), matched);
+            }
         }
     }
 

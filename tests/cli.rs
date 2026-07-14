@@ -69,7 +69,9 @@ fn conflicting_merge_exits_one_with_markers() {
         .args(&paths)
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("<<<<<<<"))
+        .stdout(predicate::eq(
+            "<<<<<<< A\nfn b() {}\n||||||| O\nfn a() {}\n=======\nfn c() {}\n>>>>>>> B\n",
+        ))
         .stderr(predicate::str::contains("relabel-relabel"));
 }
 

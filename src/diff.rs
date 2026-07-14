@@ -982,6 +982,20 @@ mod tests {
     }
 
     #[test]
+    fn larger_anchors_win_over_crossing_smaller_ones() -> Result<(), Error> {
+        // The number and the inner array swap places; only one can
+        // anchor. Largest first means the subtree wins and the lone
+        // number is demoted.
+        let o = parse_json("[5, [1, 2, 3]]")?;
+        let a = parse_json("[[1, 2, 3], 5]")?;
+        let m = anchor(&o, &a);
+        let inner = find_kind(&o, "array").last().copied();
+        assert!(inner.is_some_and(|n| m.image(n).is_some()));
+        assert_eq!(find_number(&o, "5").and_then(|n| m.image(n)), None);
+        Ok(())
+    }
+
+    #[test]
     fn duplicated_subtrees_do_not_anchor() -> Result<(), Error> {
         // The number 1 appears twice in O, so its hash is not unique
         // there and it must not anchor — even though it is unique in A.

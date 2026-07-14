@@ -34,4 +34,38 @@ exclude_re = [
     # test pins length and validity, which is the function's whole
     # contract; a mutant that broke either would be caught by it.
     'replace \+ with \* in lcs_pairs',
+    # sibling_order_holds(): a sibling's image can never equal the
+    # candidate y — y is unmatched at check time — so index equality
+    # cannot occur and < versus <= coincide.
+    'replace < with <= in sibling_order_holds',
+    # graft_branch()'s dedupe twin search: the insert-insert rule only
+    # lets equal insertion sequences through to the builder, so a
+    # budget-true entry always exists for every B insert and any
+    # bookkeeping that consumes each entry at most once skips exactly
+    # the same set. (The hash-equality half is pinned by the
+    # single-hash duplicate-statement test.)
+    'replace && with \|\| in Builder<._>::graft_branch',
+    # graft()'s placed/consumed guards: for a graft to meet an
+    # already-placed or twice-consumed survivor, the diff would have to
+    # map a node's image outside its matched ancestor's image, which
+    # admissible() forbids. The guards are defense-in-depth against
+    # matchings our phases cannot produce.
+    'replace && with \|\| in Builder<._>::graft\b',
+    # children_changed(): tree-sitter derives node-types.json from the
+    # grammar, so a node whose children match its parsed origin always
+    # satisfies the model; widening validation to unchanged nodes (or
+    # never treating them as unchanged) cannot change outcomes on
+    # parsed trees. The guard exists for cost and for grammar corners
+    # deliberately kept out of merges.
+    'children_changed',
+    # synthesize()'s unclosed-file fallback guards: distinguishable
+    # only through the cov-excl-marked defensive path (the final merged
+    # leaf is in practice its origin's closing token).
+    'delete ! in synthesize',
+    # Solver::solve()'s backtrack tail: once one side is exhausted the
+    # remaining walk emits only deletions and insertions, which the
+    # mapping does not report — and the delete branch always holds
+    # there, shielding the insert branch's condition.
+    'replace \|\| with && in Solver<T, F>::solve',
+    'replace && with \|\| in Solver<T, F>::solve',
 ]

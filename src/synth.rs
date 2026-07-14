@@ -240,6 +240,36 @@ mod tests {
     }
 
     #[test]
+    fn identical_inputs_reproduce_the_file_byte_for_byte() -> Result<(), Error> {
+        // Trailing trivia after the last leaf travels...
+        let with_tail = "fn a() {} // tail\n";
+        assert_eq!(
+            merge_text("rust", with_tail, with_tail, with_tail)?,
+            with_tail
+        );
+        // ...and a file without a final newline does not grow one.
+        let bare = "[1, 2]";
+        assert_eq!(merge_text("json", bare, bare, bare)?, bare);
+        Ok(())
+    }
+
+    #[test]
+    fn grafted_functions_pin_exact_bytes() -> Result<(), Error> {
+        // Byte-level regression for the trivia heuristics — including
+        // the known single-space wart where the O run's first leaf has
+        // no predecessor to borrow trivia from ("{} fn keep").
+        let o = "fn keep() {\n    x();\n}\n";
+        let a = "/// From A.\nfn top() {}\n\nfn keep() {\n    x();\n}\n";
+        let b = "fn keep() {\n    x();\n}\n\n/// From B.\nfn bottom() {}\n";
+        let text = merge_text("rust", o, a, b)?;
+        assert_eq!(
+            text,
+            "/// From A.\nfn top() {} fn keep() {\n    x();\n}\n\n/// From B.\nfn bottom() {}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn doc_comments_travel_with_grafted_functions() -> Result<(), Error> {
         let o = "fn keep() {\n    x();\n}\n";
         let a = "/// From A.\nfn top() {}\n\nfn keep() {\n    x();\n}\n";

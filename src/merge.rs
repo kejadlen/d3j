@@ -482,6 +482,53 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_identical_insertions_dedupe_pairwise() -> Result<(), Error> {
+        // Two equal insertions per branch: each A graft absorbs
+        // exactly one B twin, so the pair lands twice, not four times.
+        assert_merges("json", "[1]", "[1, 9, 9]", "[1, 9, 9]", "[1, 9, 9]")?;
+        // The same with a single-hash slot (no separators): dedupe
+        // must match twins by hash, not merely consume any entry.
+        assert_merges(
+            "rust",
+            "fn f() { }",
+            "fn f() { x(); x(); }",
+            "fn f() { x(); x(); }",
+            "fn f() { x(); x(); }",
+        )
+    }
+
+    #[test]
+    fn a_graft_does_not_resurrect_what_the_other_branch_deleted() -> Result<(), Error> {
+        // A wraps y() in a block; B deletes y() outright. The block
+        // survives from A, but the statement inside it died in B and
+        // must not be pulled into the graft.
+        assert_merges(
+            "rust",
+            "fn f() { x(); y(); }",
+            "fn f() { x(); { y(); } }",
+            "fn f() { x(); }",
+            "fn f() { x(); { } }",
+        )
+    }
+
+    #[test]
+    fn reformatting_only_branches_leave_bytes_alone() -> Result<(), Error> {
+        // B reformats without changing the tree, so no relabel fires,
+        // every survivor keeps its O origin, and the output is
+        // byte-identical to O.
+        let o_text = "fn keep() {\n    x(y);\n}\n";
+        let b_text = "fn keep(  ) {  x( y ) ;  }\n";
+        let o = parse(o_text, "rust")?;
+        let a = parse(o_text, "rust")?;
+        let b = parse(b_text, "rust")?;
+        match merge_to_text(&o, &a, &b)? {
+            MergeResult::Merged(text) => assert_eq!(text, o_text),
+            MergeResult::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn identical_deletions_merge_silently() -> Result<(), Error> {
         assert_merges("json", "[1, 2]", "[1]", "[1]", "[1]")
     }
@@ -554,13 +601,23 @@ mod tests {
 
     #[test]
     fn conflicting_insertions_at_one_slot_conflict() -> Result<(), Error> {
-        assert_conflicts(
+        let conflicts = assert_conflicts(
             "rust",
             "fn f() { x(); }",
             "fn f() { x(); y(); }",
             "fn f() { x(); z(); }",
             "insert-insert",
         )?;
+        // The conflict carries both branches' inserted spans.
+        let a = parse("fn f() { x(); y(); }", "rust")?;
+        let witnessed = conflicts.iter().any(|c| {
+            c.span_a
+                .clone()
+                .and_then(|span| a.source_slice(span))
+                .is_some_and(|text| text.contains("y()"))
+                && c.span_b.is_some()
+        });
+        assert!(witnessed);
         Ok(())
     }
 
@@ -646,6 +703,16 @@ mod tests {
             "fn a() { x(); }\nfn b() { y(); }",
             "fn a() { x(); z(); }\nfn b() { y(); }",
             "fn a() { x(); }",
+            "fn a() { x(); z(); }",
+        )?;
+        // And mirrored: A deletes fn b while B grows fn a. The
+        // insert-delete rule must not fire on unrelated deletions in
+        // either direction.
+        assert_merges(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { x(); }",
+            "fn a() { x(); z(); }\nfn b() { y(); }",
             "fn a() { x(); z(); }",
         )
     }

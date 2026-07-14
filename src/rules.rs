@@ -21,7 +21,7 @@ pub(crate) struct Ctx<'t> {
 /// A conflict rule over one (edit-from-A, edit-from-B) pair.
 type PairRule = fn(&Edit, &Edit, &Ctx) -> Option<Conflict>;
 
-const PAIR_RULES: &[PairRule] = &[relabel_relabel, insert_delete];
+const PAIR_RULES: &[PairRule] = &[relabel_relabel, relabel_delete, insert_delete];
 
 /// Runs the pairwise rules over every cross-branch edit pair and the
 /// aggregate rules over the whole scripts, deduplicating identical
@@ -66,6 +66,30 @@ fn relabel_relabel(ea: &Edit, eb: &Edit, ctx: &Ctx) -> Option<Conflict> {
         span_b: Some(ctx.b.span(*yb)),
         rule: "relabel-relabel",
     })
+}
+
+/// relabel-delete: one branch relabeled an O node the other branch
+/// deleted (git's delete/modify). Deletion-wins is a valid pushout,
+/// so without this rule the merge is clean and the relabel silently
+/// vanishes with the deleted subtree — surface it instead. Deletes
+/// are per-node, so a relabel anywhere inside a deleted subtree pairs
+/// with the deletion of that same node; no ancestry walk is needed.
+fn relabel_delete(ea: &Edit, eb: &Edit, ctx: &Ctx) -> Option<Conflict> {
+    match (ea, eb) {
+        (Edit::Relabel(x, y), Edit::Delete(deleted)) if x == deleted => Some(Conflict {
+            span_o: Some(ctx.o.span(*deleted)),
+            span_a: Some(ctx.a.span(*y)),
+            span_b: None,
+            rule: "relabel-delete",
+        }),
+        (Edit::Delete(deleted), Edit::Relabel(x, y)) if x == deleted => Some(Conflict {
+            span_o: Some(ctx.o.span(*deleted)),
+            span_a: None,
+            span_b: Some(ctx.b.span(*y)),
+            rule: "relabel-delete",
+        }),
+        _ => None,
+    }
 }
 
 /// insert-delete (broken dependency): one branch inserted under an O

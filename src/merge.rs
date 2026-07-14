@@ -697,6 +697,66 @@ mod tests {
     }
 
     #[test]
+    fn relabel_under_a_deleted_node_conflicts() -> Result<(), Error> {
+        // A deletes fn b outright; B edits inside its body. Without
+        // the rule, deletion wins as a valid pushout and B's edit
+        // silently vanishes.
+        let conflicts = assert_conflicts(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { x(); }",
+            "fn a() { x(); }\nfn b() { z(); }",
+            "relabel-delete",
+        )?;
+        // The conflict carries B's relabeled span.
+        let b = parse("fn a() { x(); }\nfn b() { z(); }", "rust")?;
+        let witnessed = conflicts.iter().any(|c| {
+            c.rule == "relabel-delete"
+                && c.span_b
+                    .clone()
+                    .and_then(|span| b.source_slice(span))
+                    .is_some_and(|text| text == "z")
+        });
+        assert!(witnessed);
+        Ok(())
+    }
+
+    #[test]
+    fn relabel_under_a_deleted_node_conflicts_reversed() -> Result<(), Error> {
+        // Mirrored: A edits the body B deletes.
+        assert_conflicts(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { x(); }\nfn b() { z(); }",
+            "fn a() { x(); }",
+            "relabel-delete",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn relabel_and_delete_in_different_functions_merge() -> Result<(), Error> {
+        // The rule must not fire when the relabel is outside the
+        // deleted subtree: A deletes fn b, B renames a call in fn a.
+        assert_merges(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { x(); }",
+            "fn a() { z(); }\nfn b() { y(); }",
+            "fn a() { z(); }",
+        )?;
+        // And mirrored: A renames while B deletes, exercising the
+        // rule's other arm.
+        assert_merges(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { z(); }\nfn b() { y(); }",
+            "fn a() { x(); }",
+            "fn a() { z(); }",
+        )
+    }
+
+    #[test]
     fn insert_and_delete_in_different_functions_merge() -> Result<(), Error> {
         assert_merges(
             "rust",

@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diff::{Edit, Matching};
-use crate::merge::Conflict;
+use crate::merge::{Conflict, MergedId, MergedTree, Origin};
 use crate::tree::{NodeId, Tree};
 
 /// Everything a rule may consult: the three trees and the two diffs.
@@ -159,6 +159,148 @@ fn deletion_components(o: &Tree, script: &[Edit]) -> Vec<HashSet<NodeId>> {
         component_of.insert(node, component);
     }
     components
+}
+
+/// The arity/category backstop: every merged node whose child list
+/// changed relative to its origin must still satisfy the grammar's
+/// node-types.json — required fields present exactly as often as
+/// allowed, every child's kind admitted by its slot. This is the
+/// grammar-driven stand-in for per-language syntactic-consistency
+/// rules and catches structurally invalid combinations no pairwise
+/// rule names.
+pub(crate) fn arity(o: &Tree, a: &Tree, b: &Tree, merged: &MergedTree) -> Vec<Conflict> {
+    let mut conflicts = Vec::new();
+    let mut stack = vec![merged.root()];
+    while let Some(id) = stack.pop() {
+        stack.extend(merged.children(id).iter().copied());
+        let (tree, node) = resolve(o, a, b, merged.origin(id));
+        if !children_changed(o, a, b, merged, id) {
+            continue;
+        }
+        if let Some(node_type) = tree.lang().node_types().get(tree.kind(node))
+            && !node_satisfies(o, a, b, merged, id, tree, node_type)
+        {
+            let span = tree.span(node);
+            let conflict = match merged.origin(id) {
+                Origin::O(_) => Conflict {
+                    span_o: Some(span),
+                    span_a: None,
+                    span_b: None,
+                    rule: "arity",
+                },
+                Origin::A(_) => Conflict {
+                    span_o: None,
+                    span_a: Some(span),
+                    span_b: None,
+                    rule: "arity",
+                },
+                Origin::B(_) => Conflict {
+                    span_o: None,
+                    span_a: None,
+                    span_b: Some(span),
+                    rule: "arity",
+                },
+            };
+            if !conflicts.contains(&conflict) {
+                conflicts.push(conflict);
+            }
+        }
+    }
+    conflicts
+}
+
+/// Resolves an origin tag to the tree and node it points at.
+fn resolve<'t>(o: &'t Tree, a: &'t Tree, b: &'t Tree, origin: Origin) -> (&'t Tree, NodeId) {
+    match origin {
+        Origin::O(n) => (o, n),
+        Origin::A(n) => (a, n),
+        Origin::B(n) => (b, n),
+    }
+}
+
+/// Whether a merged node's child list differs from its origin node's —
+/// only changed nodes are validated, so grammar corners our
+/// node-types model is too strict about cannot flag untouched code.
+fn children_changed(o: &Tree, a: &Tree, b: &Tree, merged: &MergedTree, id: MergedId) -> bool {
+    let (tree, node) = resolve(o, a, b, merged.origin(id));
+    let expected = tree.children(node);
+    let actual = merged.children(id);
+    if actual.len() != expected.len() {
+        return true;
+    }
+    actual.iter().zip(expected).any(|(&mc, &ec)| {
+        let same_tree = match (merged.origin(id), merged.origin(mc)) {
+            (Origin::O(_), Origin::O(n))
+            | (Origin::A(_), Origin::A(n))
+            | (Origin::B(_), Origin::B(n)) => Some(n),
+            _ => None,
+        };
+        same_tree != Some(ec)
+    })
+}
+
+/// Whether a merged node's children satisfy its node-types entry.
+fn node_satisfies(
+    o: &Tree,
+    a: &Tree,
+    b: &Tree,
+    merged: &MergedTree,
+    id: MergedId,
+    parent_tree: &Tree,
+    node_type: &crate::lang::NodeType,
+) -> bool {
+    let node_types = parent_tree.lang().node_types();
+    let language = parent_tree.lang().language();
+
+    // Each merged child resolved to (field name, kind, named).
+    let members: Vec<(Option<&str>, &str, bool)> = merged
+        .children(id)
+        .iter()
+        .map(|&child| {
+            let (tree, node) = resolve(o, a, b, merged.origin(child));
+            let field = tree
+                .field_id(node)
+                .and_then(|fid| language.field_name_for_id(fid.get()));
+            (field, tree.kind(node), tree.is_named(node))
+        })
+        .collect();
+
+    for (name, slot) in &node_type.fields {
+        let filled: Vec<_> = members
+            .iter()
+            .filter(|(field, _, _)| field.is_some_and(|f| f == name))
+            .collect();
+        if slot.required && filled.is_empty() {
+            return false;
+        }
+        if !slot.multiple && filled.len() > 1 {
+            return false;
+        }
+        if filled
+            .iter()
+            .any(|(_, kind, _)| !node_types.admits(&slot.types, kind))
+        {
+            return false;
+        }
+    }
+
+    let loose: Vec<_> = members
+        .iter()
+        .filter(|(field, _, named)| field.is_none() && *named)
+        .collect();
+    if let Some(slot) = &node_type.children {
+        if slot.required && loose.is_empty() {
+            return false;
+        }
+        if loose
+            .iter()
+            .any(|(_, kind, _)| !node_types.admits(&slot.types, kind))
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// insert-insert: both branches inserted at the same slot — same

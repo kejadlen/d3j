@@ -125,6 +125,33 @@ impl NodeTypes {
         self.by_kind.get(kind)
     }
 
+    /// Whether `allowed` admits a child of `kind`, expanding supertype
+    /// entries (like rust's `_expression`) through their subtypes.
+    pub fn admits(&self, allowed: &[TypeRef], kind: &str) -> bool {
+        let mut seen: Vec<&str> = Vec::new();
+        self.admits_inner(allowed, kind, &mut seen)
+    }
+
+    fn admits_inner<'s>(
+        &'s self,
+        allowed: &'s [TypeRef],
+        kind: &str,
+        seen: &mut Vec<&'s str>,
+    ) -> bool {
+        allowed.iter().any(|type_ref| {
+            if type_ref.kind == kind {
+                return true;
+            }
+            if seen.iter().any(|&visited| visited == type_ref.kind) {
+                return false;
+            }
+            seen.push(&type_ref.kind);
+            self.by_kind
+                .get(&type_ref.kind)
+                .is_some_and(|node_type| self.admits_inner(&node_type.subtypes, kind, seen))
+        })
+    }
+
     fn parse(json: &str) -> Result<Self, serde_json::Error> {
         let entries: Vec<Entry> = serde_json::from_str(json)?;
         // Keep only named entries: a kind name can appear twice — once

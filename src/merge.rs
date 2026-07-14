@@ -135,10 +135,19 @@ pub fn merge(o: &Tree, a: &Tree, b: &Tree) -> Result<MergeOutcome, Error> {
         consumed: HashSet::new(),
     };
     let root = builder.build_survivor(o.root());
-    Ok(MergeOutcome::Merged(MergedTree {
+    let merged = MergedTree {
         nodes: builder.nodes,
         root,
-    }))
+    };
+
+    // The grammar backstop: individually clean edits can still combine
+    // into a structurally invalid tree.
+    let arity_conflicts = rules::arity(o, a, b, &merged);
+    if !arity_conflicts.is_empty() {
+        return Ok(MergeOutcome::Conflicts(arity_conflicts));
+    }
+
+    Ok(MergeOutcome::Merged(merged))
 }
 
 /// Which branch a graft comes from, with its diff to O and to-M pull
@@ -521,6 +530,74 @@ mod tests {
             "fn a() { x(); z(); }\nfn b() { y(); }",
             "fn a() { x(); }",
             "fn a() { x(); z(); }",
+        )
+    }
+
+    /// Clones O into a candidate MergedTree, skipping one node (and
+    /// its subtree).
+    fn clone_skipping(o: &Tree, skip: Option<crate::tree::NodeId>) -> MergedTree {
+        fn walk(
+            o: &Tree,
+            node: crate::tree::NodeId,
+            skip: Option<crate::tree::NodeId>,
+            nodes: &mut Vec<MergedNode>,
+        ) -> MergedId {
+            let children = o
+                .children(node)
+                .iter()
+                .filter(|&&c| Some(c) != skip)
+                .map(|&c| walk(o, c, skip, nodes))
+                .collect();
+            let id = MergedId(nodes.len());
+            nodes.push(MergedNode {
+                origin: Origin::O(node),
+                children,
+            });
+            id
+        }
+        let mut nodes = Vec::new();
+        let root = walk(o, o.root(), skip, &mut nodes);
+        MergedTree { nodes, root }
+    }
+
+    #[test]
+    fn an_emptied_required_field_fires_the_arity_rule() -> Result<(), Error> {
+        // Branch edits that are individually fine can combine into a
+        // grammar-invalid tree. The pairwise rules usually fire first
+        // in real merges, so drive the backstop directly: a candidate
+        // M that is O minus a required field (the if-condition).
+        let o = parse("fn f() { if c { } }", "rust")?;
+        let lang = Lang::by_name("rust").ok_or(Error::UnknownLanguage {
+            path: "rust".into(),
+        })?;
+        let condition_field = lang.language().field_id_for_name("condition");
+        let condition = o
+            .nodes()
+            .find(|&n| o.field_id(n).is_some() && o.field_id(n) == condition_field);
+        assert!(condition.is_some());
+
+        let broken = clone_skipping(&o, condition);
+        let conflicts = crate::rules::arity(&o, &o, &o, &broken);
+        assert!(!conflicts.is_empty());
+        assert!(conflicts.iter().all(|c| c.rule == "arity"));
+
+        // The intact clone passes.
+        let intact = clone_skipping(&o, None);
+        assert_eq!(crate::rules::arity(&o, &o, &o, &intact), Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn variable_arity_growth_does_not_fire_the_arity_rule() -> Result<(), Error> {
+        // Two statements inserted into one block is legal growth; the
+        // full merge pipeline (now ending in the arity check) stays
+        // clean.
+        assert_merges(
+            "rust",
+            "fn f() { x(); }",
+            "fn f() { x(); y(); }",
+            "fn f() { w(); x(); }",
+            "fn f() { w(); x(); y(); }",
         )
     }
 

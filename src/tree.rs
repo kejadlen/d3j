@@ -36,6 +36,7 @@ impl NodeId {
 /// structural merge requires syntactically valid inputs.
 #[derive(Debug)]
 pub struct Tree {
+    lang: &'static Lang,
     source: String,
     nodes: Vec<NodeData>,
     hashes: Vec<u64>,
@@ -86,6 +87,7 @@ impl Tree {
 
         let nodes = lift(root);
         let mut tree = Self {
+            lang,
             source: source.into(),
             nodes,
             hashes: Vec::new(),
@@ -94,9 +96,20 @@ impl Tree {
         Ok(tree)
     }
 
+    /// The language this tree was parsed with.
+    pub fn lang(&self) -> &'static Lang {
+        self.lang
+    }
+
     /// The root node (arena index 0).
     pub fn root(&self) -> NodeId {
         NodeId(0)
+    }
+
+    /// Whether the node is named (a grammar rule) as opposed to an
+    /// anonymous token like `+`.
+    pub fn is_named(&self, id: NodeId) -> bool {
+        self.node(id).named
     }
 
     /// All nodes in pre-order.

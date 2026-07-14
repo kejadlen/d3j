@@ -1,0 +1,262 @@
+//! Span-based synthesis: turn a merged tree back into source text by
+//! emitting original bytes.
+//!
+//! The merged tree's leaves are visited depth-first. A maximal run of
+//! consecutive leaves that are *adjacent* in one origin file emits as a
+//! single contiguous slice of that file — byte-identical, so interior
+//! comments and formatting survive. Adjacency (consecutive positions in
+//! the origin's leaf sequence) is what separates preserved trivia from
+//! deleted code: a gap in the sequence means something between the two
+//! leaves was deleted, and slicing across it would resurrect it.
+//!
+//! Where the origin switches, the inter-token trivia comes from the
+//! incoming leaf's own file — the text between its preceding leaf there
+//! and itself — which is how a grafted function's doc comment travels.
+//! An incoming leaf with no predecessor (its file's first leaf) falls
+//! back to a single space unless the output is empty, in which case its
+//! leading trivia (a file header comment) is emitted instead.
+
+use crate::merge::{MergedTree, Origin};
+use crate::tree::{NodeId, Tree};
+
+/// Renders the merged tree as source text.
+pub fn synthesize(merged: &MergedTree, o: &Tree, a: &Tree, b: &Tree) -> String {
+    let trees = [o, a, b];
+    let sequences: [LeafSequence; 3] = [
+        LeafSequence::of(o),
+        LeafSequence::of(a),
+        LeafSequence::of(b),
+    ];
+
+    // The merged leaves, as (tree index, origin node), in order.
+    let mut leaves: Vec<(usize, NodeId)> = Vec::new();
+    let mut stack = vec![merged.root()];
+    while let Some(id) = stack.pop() {
+        let (tree_index, node) = match merged.origin(id) {
+            Origin::O(n) => (0, n),
+            Origin::A(n) => (1, n),
+            Origin::B(n) => (2, n),
+        };
+        let children = merged.children(id);
+        if children.is_empty() {
+            // Only origin-leaves emit: a merged node emptied of the
+            // children its origin had must not emit the origin span,
+            // which still covers them.
+            if trees
+                .get(tree_index)
+                .is_some_and(|tree| tree.children(node).is_empty())
+            {
+                leaves.push((tree_index, node));
+            }
+        } else {
+            stack.extend(children.iter().rev().copied());
+        }
+    }
+
+    let mut out = String::new();
+    let mut run: Option<Run> = None;
+    for (tree_index, node) in leaves {
+        let (Some(&tree), Some(sequence)) = (trees.get(tree_index), sequences.get(tree_index))
+        else {
+            continue;
+        };
+        let Some(position) = sequence.position(node) else {
+            continue;
+        };
+        let span = tree.span(node);
+
+        if let Some(current) = &mut run
+            && current.tree_index == tree_index
+            && position == current.last_position.saturating_add(1)
+        {
+            current.end = span.end;
+            current.last_position = position;
+            continue;
+        }
+
+        // Origin switch (or non-adjacent same-origin leaf): flush the
+        // run, then bring the incoming leaf's leading trivia along.
+        flush(&mut out, run.take(), &trees);
+        match preceding_trivia(tree, sequence, position, span.start) {
+            Some(trivia) => out.push_str(trivia),
+            None if out.is_empty() => {
+                out.push_str(tree.source_slice(0..span.start).unwrap_or(""));
+            }
+            None => {
+                if !out.ends_with(char::is_whitespace) {
+                    out.push(' ');
+                }
+            }
+        }
+        run = Some(Run {
+            tree_index,
+            start: span.start,
+            end: span.end,
+            last_position: position,
+        });
+    }
+
+    // Flush and close the file: trailing trivia only when the last
+    // leaf is also its origin's last leaf — anything after an interior
+    // leaf might be deleted code.
+    let last = run
+        .as_ref()
+        .map(|current| (current.tree_index, current.last_position));
+    flush(&mut out, run.take(), &trees);
+    let closed = last.is_some_and(|(tree_index, position)| {
+        let (Some(&tree), Some(sequence)) = (trees.get(tree_index), sequences.get(tree_index))
+        else {
+            return false;
+        };
+        if position.saturating_add(1) != sequence.len() {
+            return false;
+        }
+        let Some(last_node) = sequence.node_at(position) else {
+            return false;
+        };
+        let tail = tree.source_slice(tree.span(last_node).end..tree.source_len());
+        out.push_str(tail.unwrap_or(""));
+        true
+    });
+    if !closed && !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    out
+}
+
+/// One in-progress contiguous slice of a single origin file.
+struct Run {
+    tree_index: usize,
+    start: usize,
+    end: usize,
+    last_position: usize,
+}
+
+fn flush(out: &mut String, run: Option<Run>, trees: &[&Tree; 3]) {
+    if let Some(run) = run
+        && let Some(&tree) = trees.get(run.tree_index)
+    {
+        out.push_str(tree.source_slice(run.start..run.end).unwrap_or(""));
+    }
+}
+
+/// The trivia between a leaf and its predecessor in its own file, or
+/// `None` for a file's first leaf.
+fn preceding_trivia<'t>(
+    tree: &'t Tree,
+    sequence: &LeafSequence,
+    position: usize,
+    start: usize,
+) -> Option<&'t str> {
+    let previous = sequence.node_at(position.checked_sub(1)?)?;
+    tree.source_slice(tree.span(previous).end..start)
+}
+
+/// A tree's leaves in document order, with a node → position lookup.
+struct LeafSequence {
+    order: Vec<NodeId>,
+    position: Vec<Option<usize>>,
+}
+
+impl LeafSequence {
+    fn of(tree: &Tree) -> Self {
+        let mut order = Vec::new();
+        let mut position = vec![None; tree.nodes().count()];
+        for node in tree.nodes() {
+            if tree.children(node).is_empty() {
+                if let Some(slot) = position.get_mut(node.index()) {
+                    *slot = Some(order.len());
+                }
+                order.push(node);
+            }
+        }
+        Self { order, position }
+    }
+
+    fn position(&self, node: NodeId) -> Option<usize> {
+        self.position.get(node.index()).copied().flatten()
+    }
+
+    fn node_at(&self, position: usize) -> Option<NodeId> {
+        self.order.get(position).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::Shape;
+    use crate::error::Error;
+    use crate::lang::Lang;
+    use crate::merge::{MergeOutcome, merge};
+
+    fn parse(src: &str, lang_name: &str) -> Result<Tree, Error> {
+        let lang = Lang::by_name(lang_name).ok_or(Error::UnknownLanguage {
+            path: lang_name.into(),
+        })?;
+        Tree::parse(src, lang)
+    }
+
+    fn merge_text(lang: &str, o: &str, a: &str, b: &str) -> Result<String, Error> {
+        let o = parse(o, lang)?;
+        let a = parse(a, lang)?;
+        let b = parse(b, lang)?;
+        match merge(&o, &a, &b)? {
+            MergeOutcome::Merged(m) => Ok(synthesize(&m, &o, &a, &b)),
+            MergeOutcome::Conflicts(conflicts) => {
+                panic!("expected a clean merge, got conflicts: {conflicts:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_sided_edits_reproduce_the_editing_branch_byte_for_byte() -> Result<(), Error> {
+        let o = "// header\nfn a() {\n    x(); // call\n}\n\nfn b() {\n    y();\n}\n";
+        let a = "// header\nfn a() {\n    x(); // call\n}\n\nfn b() {\n    y();\n    z();\n}\n";
+        let text = merge_text("rust", o, a, o)?;
+        assert_eq!(text, a);
+        Ok(())
+    }
+
+    #[test]
+    fn figure_2_3_output_parses_to_the_expected_shape() -> Result<(), Error> {
+        let text = merge_text("json", "[1, 2, 3]", "[1, 2, 4, 5, 3]", "[1, 6, 3]")?;
+        let merged = parse(&text, "json")?;
+        let expected = parse("[1, 6, 4, 5, 3]", "json")?;
+        assert_eq!(Shape::of(&merged), Shape::of(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_regions_do_not_resurface() -> Result<(), Error> {
+        let text = merge_text("json", "[1, 2, 3]", "[1, 3]", "[1, 3]")?;
+        assert!(!text.contains('2'), "{text:?}");
+        let merged = parse(&text, "json")?;
+        let expected = parse("[1, 3]", "json")?;
+        assert_eq!(Shape::of(&merged), Shape::of(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn doc_comments_travel_with_grafted_functions() -> Result<(), Error> {
+        let o = "fn keep() {\n    x();\n}\n";
+        let a = "/// From A.\nfn top() {}\n\nfn keep() {\n    x();\n}\n";
+        let b = "fn keep() {\n    x();\n}\n\n/// From B.\nfn bottom() {}\n";
+        let text = merge_text("rust", o, a, b)?;
+        assert!(text.contains("/// From A."), "{text:?}");
+        assert!(text.contains("/// From B."), "{text:?}");
+        let merged = parse(&text, "rust")?;
+        let names: Vec<_> = merged
+            .nodes()
+            .filter(|&n| merged.kind(n) == "identifier")
+            .filter_map(|n| merged.label(n))
+            .collect();
+        assert_eq!(names, vec!["top", "keep", "x", "bottom"]);
+        Ok(())
+    }
+}

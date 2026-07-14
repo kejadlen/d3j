@@ -152,6 +152,11 @@ impl Tree {
         self.source.get(span)
     }
 
+    /// The source length in bytes.
+    pub fn source_len(&self) -> usize {
+        self.source.len()
+    }
+
     /// The node's children, in source order.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.node(id).children

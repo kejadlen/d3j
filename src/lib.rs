@@ -5,6 +5,7 @@ pub mod hash;
 pub mod lang;
 pub mod merge;
 mod rules;
+pub mod synth;
 pub mod tree;
 pub mod zs;
 

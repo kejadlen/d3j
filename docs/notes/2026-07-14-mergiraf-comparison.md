@@ -181,10 +181,67 @@ Java, JSON).
 
 ## Follow-ups
 
-- Add the relabel-under-delete conflict rule; turn the two probes
-  above into corpus scenarios (they fail today).
+- ~~Add the relabel-under-delete conflict rule; turn the two probes
+  above into corpus scenarios~~ — done, see the update below.
 - Revisit the move probe when move detection lands; it should then
   merge cleanly with the edit preserved.
-- Consider trivia-preference synthesis for reformat-only branches.
+- ~~Consider trivia-preference synthesis for reformat-only
+  branches~~ — done for pure reformat-only branches, see below.
 - A corpus-scale rerun of this comparison is cheap; rerun it after
   each of the above.
+
+## Update, later the same day
+
+Three of the follow-ups landed, and a sweep of mergiraf's own example
+suite (52 Rust/Java/JSON cases under its `examples/` directory, run
+in place rather than vendored — mergiraf is GPL-3.0 and d3j declares
+no license) found one more gap class.
+
+What landed:
+
+- The `relabel-delete` pair rule: a relabel inside a subtree the
+  other branch deleted now conflicts instead of silently vanishing.
+  Both probes above are corpus scenarios (`relabel-delete`,
+  `move-loses-edit`).
+- The `name-collision` aggregate rule, prompted by the suite sweep:
+  five of six silent bad merges d3j produced on mergiraf's examples
+  were both branches inserting a same-named definition at *different*
+  slots — two `class Hello`, a JSON object holding one key twice.
+  Slot-based insert-insert never fired. The rule keys inserted nodes
+  by their `name`/`key` field child; deliberately coarser than real
+  signatures (concurrent same-name Java overload insertions conflict
+  too, and identical insertions at different slots conflict rather
+  than dedupe, where mergiraf merges them).
+- Reformat preference: when exactly one branch made no tree edits but
+  its bytes differ from O, merge origins remap to that branch, so its
+  layout survives the other branch's edits. The reformat-edit probe
+  above now produces mergiraf's ideal output. Concurrent distinct
+  reformats still resolve to A's layout — span synthesis cannot honor
+  two reformats of the same code at once.
+
+Remaining gaps the suite sweep exposed, in rough order of value:
+
+- Commutative-list merging. About half of the suite's clean-for-
+  mergiraf cases conflict in d3j: both branches adding imports, use
+  statements, or class members at the same slot is insert-insert for
+  d3j, while mergiraf's per-language "commutative parent" metadata
+  merges them (`use_statements`, `star_imports`, `module_members`,
+  `interface_list`, …).
+- Comment edits are invisible. `use crate::{foo, /* bar */}` vs
+  `/* baz */`: comments are trivia, so d3j sees two identical
+  comma-inserts, dedupes, and outputs `use crate::{foo,};` — both
+  branches' comments dropped, and mergiraf's expected conflict never
+  fires. Needs comment-aware matching or synthesis.
+- Signature collisions via composition. mergiraf's
+  `conflicting_method_signatures`: A adds a parameter to `run`, B
+  renames `run` to `runNow`; the composed `runNow(Environment env)`
+  duplicates a separately-inserted method of the same name.
+  name-collision only inspects insert-vs-insert pairs, so catching
+  this needs post-merge name-uniqueness validation over the merged
+  tree (arity-style), which is the "Java conflict-rule depth"
+  milestone.
+
+After the fixes, d3j handles all 14 corpus scenarios correctly
+(mergiraf's clean merge on `move-loses-edit` is its move detection
+producing the ideal result — d3j stays conflict-safe there until move
+detection lands).

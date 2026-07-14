@@ -201,9 +201,10 @@ pub fn anchor(src: &Tree, dst: &Tree) -> Matching {
         }
         // Equal hashes virtually always mean equal structure, but a
         // 64-bit collision would corrupt the matching; verify before
-        // committing the subtree.
+        // committing the subtree. The rejection itself is pinned by
+        // structural_eq's own tests.
         if !structural_eq(src, s, dst, d) {
-            continue;
+            continue; // cov-excl-line: unreachable through real hashes.
         }
         match_subtree(&mut m, src, s, dst, d);
         placed.push((s, d));
@@ -740,7 +741,7 @@ fn sibling_order_holds(
     y: NodeId,
 ) -> bool {
     let Some(parent) = tree.parent(x) else {
-        return true;
+        return true; // cov-excl-line: candidates come from gaps, never the root.
     };
     let mut before = true;
     for &sibling in tree.children(parent) {

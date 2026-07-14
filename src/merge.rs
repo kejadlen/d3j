@@ -307,19 +307,19 @@ impl Builder<'_> {
             self.graft_branch(Branch::B, yb, &base_position, &mut slots);
         }
 
-        // Materialize: slot grafts, then the base survivor they precede.
+        // Materialize: slot grafts, then the base survivor they
+        // precede. Slots are sized base.len()+1, so the indexing below
+        // stays in bounds.
         let mut children: Vec<MergedId> = Vec::new();
+        #[allow(clippy::indexing_slicing)]
         for (i, &c) in base.iter().enumerate() {
-            if let Some(slot) = slots.get(i) {
-                children.extend(slot.iter().map(|entry| entry.id));
-            }
+            children.extend(slots[i].iter().map(|entry| entry.id));
             if !self.consumed.contains(&c) {
                 children.push(self.build_survivor(c));
             }
         }
-        if let Some(slot) = slots.last() {
-            children.extend(slot.iter().map(|entry| entry.id));
-        }
+        #[allow(clippy::indexing_slicing)]
+        children.extend(slots[base.len()].iter().map(|entry| entry.id));
 
         self.push(MergedNode { origin, children })
     }
@@ -354,8 +354,10 @@ impl Builder<'_> {
                 }
                 None => {
                     let hash = tree.hash(child);
+                    // Cursor is at most base.len(); slots has one more.
+                    #[allow(clippy::indexing_slicing)]
+                    let slot = &mut slots[cursor];
                     if matches!(branch, Branch::B)
-                        && let Some(slot) = slots.get_mut(cursor)
                         && let Some(twin) = slot
                             .iter_mut()
                             .find(|entry| entry.dedupes_b && entry.hash == hash)
@@ -364,13 +366,11 @@ impl Builder<'_> {
                         continue;
                     }
                     let id = self.graft(branch, child);
-                    if let Some(slot) = slots.get_mut(cursor) {
-                        slot.push(SlotEntry {
-                            hash,
-                            id,
-                            dedupes_b: matches!(branch, Branch::A),
-                        });
-                    }
+                    slot.push(SlotEntry {
+                        hash,
+                        id,
+                        dedupes_b: matches!(branch, Branch::A),
+                    });
                 }
             }
         }
@@ -599,6 +599,35 @@ mod tests {
     }
 
     #[test]
+    fn insert_under_a_deleted_node_conflicts_reversed() -> Result<(), Error> {
+        // Same broken dependency with the branches swapped: B grows
+        // the body A deletes.
+        assert_conflicts(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn b() { y(); }",
+            "fn a() { x(); z(); }\nfn b() { y(); }",
+            "insert-delete",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn disjoint_deletions_emptying_required_children_conflict() -> Result<(), Error> {
+        // A drops E1, B drops E2 — individually fine, disjoint (so no
+        // delete-delete), but together they empty the throws list,
+        // whose children the grammar requires.
+        assert_conflicts(
+            "java",
+            "class C { void m() throws E1, E2 { } }",
+            "class C { void m() throws E2 { } }",
+            "class C { void m() throws E1 { } }",
+            "arity",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn insert_into_a_deleted_inner_class_conflicts() -> Result<(), Error> {
         assert_conflicts(
             "java",
@@ -659,6 +688,45 @@ mod tests {
             panic!("expected a self-check conflict");
         };
         assert!(conflicts.iter().all(|c| c.rule == "self-check"));
+        Ok(())
+    }
+
+    #[test]
+    fn self_check_maps_each_violation_kind_to_its_span_slot() -> Result<(), Error> {
+        // Extra deletion: both branches kept 2, the fake output lost it.
+        let o = parse("[1, 2]", "json")?;
+        let same = parse("[1, 2]", "json")?;
+        let same2 = parse("[1, 2]", "json")?;
+        let result = merge_to_text_with(&o, &same, &same2, |_, _, _, _| "[1]".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected self-check conflicts");
+        };
+        assert!(conflicts.iter().any(|c| c.span_o.is_some()));
+
+        // Missed insertion from B: the fake output drops B's 3.
+        let b = parse("[1, 2, 3]", "json")?;
+        let o = parse("[1, 2]", "json")?;
+        let a = parse("[1, 2]", "json")?;
+        let result = merge_to_text_with(&o, &a, &b, |_, _, _, _| "[1, 2]".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected self-check conflicts");
+        };
+        assert!(conflicts.iter().any(|c| c.span_b.is_some()));
+
+        // Extra insertion: nobody wrote 9; the witness lives in M, so
+        // no span slot is filled.
+        let o = parse("[1]", "json")?;
+        let a = parse("[1]", "json")?;
+        let b = parse("[1]", "json")?;
+        let result = merge_to_text_with(&o, &a, &b, |_, _, _, _| "[1, 9]".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected self-check conflicts");
+        };
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.span_o.is_none() && c.span_a.is_none() && c.span_b.is_none())
+        );
         Ok(())
     }
 
@@ -729,6 +797,119 @@ mod tests {
         // The intact clone passes.
         let intact = clone_skipping(&o, None);
         assert_eq!(crate::rules::arity(&o, &o, &o, &intact), Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn arity_attributes_grafted_nodes_to_their_branch() -> Result<(), Error> {
+        // A branch-origin node emptied of its children is attributed
+        // to that branch's span slot.
+        let tree = parse("fn f() { if c { } }", "rust")?;
+        let if_node = tree.nodes().find(|&n| tree.kind(n) == "if_expression");
+        assert!(if_node.is_some());
+        let as_root = |origin: Origin| MergedTree {
+            nodes: vec![MergedNode {
+                origin,
+                children: Vec::new(),
+            }],
+            root: MergedId(0),
+        };
+
+        for (origin, expect_a, expect_b) in [
+            (Origin::A(if_node.unwrap_or(tree.root())), true, false),
+            (Origin::B(if_node.unwrap_or(tree.root())), false, true),
+        ] {
+            let conflicts = crate::rules::arity(&tree, &tree, &tree, &as_root(origin));
+            assert_eq!(conflicts.len(), 1);
+            let conflict = conflicts.first();
+            assert_eq!(conflict.is_some_and(|c| c.span_a.is_some()), expect_a);
+            assert_eq!(conflict.is_some_and(|c| c.span_b.is_some()), expect_b);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn arity_rejects_a_doubled_single_slot_field() -> Result<(), Error> {
+        // Two children in the non-multiple condition field.
+        let tree = parse("fn f() { if c { } }", "rust")?;
+        let lang = Lang::by_name("rust").ok_or(Error::UnknownLanguage {
+            path: "rust".into(),
+        })?;
+        let condition_field = lang.language().field_id_for_name("condition");
+        let condition = tree
+            .nodes()
+            .find(|&n| tree.field_id(n).is_some() && tree.field_id(n) == condition_field);
+        let if_node = tree.nodes().find(|&n| tree.kind(n) == "if_expression");
+        let (Some(condition), Some(if_node)) = (condition, if_node) else {
+            panic!("if expression with a condition parses");
+        };
+
+        // Clone the whole tree and add a second condition child, so
+        // every other slot stays valid and the multiplicity check is
+        // what fires.
+        let mut doubled = clone_skipping(&tree, None);
+        let extra = MergedId(doubled.nodes.len());
+        doubled.nodes.push(MergedNode {
+            origin: Origin::O(condition),
+            children: Vec::new(),
+        });
+        for node in &mut doubled.nodes {
+            if node.origin == Origin::O(if_node) {
+                node.children.push(extra);
+            }
+        }
+        let conflicts = crate::rules::arity(&tree, &tree, &tree, &doubled);
+        assert!(!conflicts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn arity_rejects_a_wrong_kind_in_a_field() -> Result<(), Error> {
+        // A struct's type_identifier fills the "name" field too, but
+        // function_item's name slot does not admit that kind.
+        // Clone the whole tree, then swap only the function's name for
+        // the struct's type_identifier, so every other field stays
+        // filled and the kind check is what fires.
+        let tree = parse("fn f() {}\nstruct S;", "rust")?;
+        let fn_name = tree.nodes().find(|&n| tree.label(n) == Some("f"));
+        let type_name = tree.nodes().find(|&n| tree.kind(n) == "type_identifier");
+        let (Some(fn_name), Some(type_name)) = (fn_name, type_name) else {
+            panic!("both items parse");
+        };
+        let mut wrong = clone_skipping(&tree, None);
+        for node in &mut wrong.nodes {
+            if node.origin == Origin::O(fn_name) {
+                node.origin = Origin::O(type_name);
+            }
+        }
+        let conflicts = crate::rules::arity(&tree, &tree, &tree, &wrong);
+        assert!(!conflicts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn arity_rejects_a_loose_child_of_the_wrong_kind() -> Result<(), Error> {
+        // A parameters node is not a declaration; source_file's
+        // children slot rejects it. Only the root's child list changes
+        // (a full clone plus one extra child), so this pins the
+        // loose-kind branch specifically.
+        let tree = parse("fn f() { x(); }", "rust")?;
+        let parameters = tree.nodes().find(|&n| tree.kind(n) == "parameters");
+        let Some(parameters) = parameters else {
+            panic!("the function's parameters parse");
+        };
+        let mut wrong = clone_skipping(&tree, None);
+        let extra = MergedId(wrong.nodes.len());
+        wrong.nodes.push(MergedNode {
+            origin: Origin::O(parameters),
+            children: Vec::new(),
+        });
+        let root = wrong.root;
+        if let Some(root_node) = wrong.nodes.get_mut(root.0) {
+            root_node.children.push(extra);
+        }
+        let conflicts = crate::rules::arity(&tree, &tree, &tree, &wrong);
+        assert!(!conflicts.is_empty());
         Ok(())
     }
 

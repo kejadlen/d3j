@@ -56,12 +56,11 @@ pub fn synthesize(merged: &MergedTree, o: &Tree, a: &Tree, b: &Tree) -> String {
     let mut out = String::new();
     let mut run: Option<Run> = None;
     for (tree_index, node) in leaves {
-        let (Some(&tree), Some(sequence)) = (trees.get(tree_index), sequences.get(tree_index))
-        else {
-            continue;
-        };
+        // Tree indices are 0..3 by construction of the leaf list.
+        #[allow(clippy::indexing_slicing)]
+        let (tree, sequence) = (trees[tree_index], &sequences[tree_index]);
         let Some(position) = sequence.position(node) else {
-            continue;
+            continue; // cov-excl-line: merged leaves are origin leaves.
         };
         let span = tree.span(node);
 
@@ -104,22 +103,20 @@ pub fn synthesize(merged: &MergedTree, o: &Tree, a: &Tree, b: &Tree) -> String {
         .map(|current| (current.tree_index, current.last_position));
     flush(&mut out, run.take(), &trees);
     let closed = last.is_some_and(|(tree_index, position)| {
-        let (Some(&tree), Some(sequence)) = (trees.get(tree_index), sequences.get(tree_index))
-        else {
-            return false;
-        };
+        #[allow(clippy::indexing_slicing)] // Tree indices are 0..3.
+        let (tree, sequence) = (trees[tree_index], &sequences[tree_index]);
         if position.saturating_add(1) != sequence.len() {
-            return false;
+            return false; // cov-excl-line: in practice the final merged leaf is its origin's closing token, which is that file's last leaf.
         }
         let Some(last_node) = sequence.node_at(position) else {
-            return false;
+            return false; // cov-excl-line: the position was just bounds-checked.
         };
         let tail = tree.source_slice(tree.span(last_node).end..tree.source_len());
         out.push_str(tail.unwrap_or(""));
         true
     });
     if !closed && !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+        out.push('\n'); // cov-excl-line: fallback for the unclosed case above.
     }
 
     out

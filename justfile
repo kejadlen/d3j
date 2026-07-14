@@ -9,8 +9,12 @@ check:
 clippy:
     cargo clippy --workspace -- -D warnings
 
+# The gate is 98 rather than 100 because grcov measures #[cfg(test)]
+# modules too, and their failure paths — panic! arms and `?` error
+# branches — never run in a passing suite. Library code is either
+# covered or carries an explicit cov-excl-line with reasoning.
 coverage:
-    ./bin/coverage
+    COVERAGE_THRESHOLD=98 ./bin/coverage
 
 mutants:
     #!/usr/bin/env bash

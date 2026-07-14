@@ -252,7 +252,10 @@ fn node_satisfies(
     let node_types = parent_tree.lang().node_types();
     let language = parent_tree.lang().language();
 
-    // Each merged child resolved to (field name, kind, named).
+    // Each merged child resolved to (field name, kind, named). A
+    // child's field id travels with its origin node; a field this
+    // parent kind does not define (a graft that came from a different
+    // context) counts as loose so the children slot still vets it.
     let members: Vec<(Option<&str>, &str, bool)> = merged
         .children(id)
         .iter()
@@ -260,7 +263,8 @@ fn node_satisfies(
             let (tree, node) = resolve(o, a, b, merged.origin(child));
             let field = tree
                 .field_id(node)
-                .and_then(|fid| language.field_name_for_id(fid.get()));
+                .and_then(|fid| language.field_name_for_id(fid.get()))
+                .filter(|name| node_type.fields.contains_key(*name));
             (field, tree.kind(node), tree.is_named(node))
         })
         .collect();

@@ -421,10 +421,9 @@ mod tests {
                 panic!("expected conflicts, got a merge: {:?}", m.shape(&o, &a, &b));
             }
             MergeOutcome::Conflicts(conflicts) => {
-                assert!(!conflicts.is_empty());
                 assert!(
-                    conflicts.iter().all(|c| c.rule == rule),
-                    "expected only {rule}: {conflicts:?}"
+                    conflicts.iter().any(|c| c.rule == rule),
+                    "expected a {rule} conflict: {conflicts:?}"
                 );
                 Ok(conflicts)
             }
@@ -472,6 +471,57 @@ mod tests {
     fn different_value_insertions_at_one_slot_conflict() -> Result<(), Error> {
         assert_conflicts("json", "[1]", "[1, 9]", "[1, 8]", "insert-insert")?;
         Ok(())
+    }
+
+    #[test]
+    fn overlapping_deletions_conflict() -> Result<(), Error> {
+        // The paper's f(c) example: A rewrites f(c) to x = c, deleting
+        // the call wrapper; B deletes the whole statement. The deletion
+        // regions overlap without coinciding.
+        assert_conflicts(
+            "rust",
+            "fn main() { f(c); }",
+            "fn main() { x = c; }",
+            "fn main() { }",
+            "delete-delete",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn insert_under_a_deleted_node_conflicts() -> Result<(), Error> {
+        // A grows fn a's body; B deletes fn a outright.
+        assert_conflicts(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { x(); z(); }\nfn b() { y(); }",
+            "fn b() { y(); }",
+            "insert-delete",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn insert_into_a_deleted_inner_class_conflicts() -> Result<(), Error> {
+        assert_conflicts(
+            "java",
+            "class O { class I { } }",
+            "class O { class I { void m() { } } }",
+            "class O { }",
+            "insert-delete",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn insert_and_delete_in_different_functions_merge() -> Result<(), Error> {
+        assert_merges(
+            "rust",
+            "fn a() { x(); }\nfn b() { y(); }",
+            "fn a() { x(); z(); }\nfn b() { y(); }",
+            "fn a() { x(); }",
+            "fn a() { x(); z(); }",
+        )
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! common edits once; these rules name the combinations that cannot
 //! merge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::diff::{Edit, Matching};
 use crate::merge::Conflict;
@@ -21,7 +21,7 @@ pub(crate) struct Ctx<'t> {
 /// A conflict rule over one (edit-from-A, edit-from-B) pair.
 type PairRule = fn(&Edit, &Edit, &Ctx) -> Option<Conflict>;
 
-const PAIR_RULES: &[PairRule] = &[relabel_relabel];
+const PAIR_RULES: &[PairRule] = &[relabel_relabel, insert_delete];
 
 /// Runs the pairwise rules over every cross-branch edit pair and the
 /// aggregate rules over the whole scripts, deduplicating identical
@@ -46,6 +46,7 @@ pub(crate) fn conflicts(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit]) -> Vec<Co
         }
     }
     insert_insert(ctx, edits_a, edits_b, &mut found);
+    delete_delete(ctx, edits_a, edits_b, &mut found);
     found
 }
 
@@ -65,6 +66,99 @@ fn relabel_relabel(ea: &Edit, eb: &Edit, ctx: &Ctx) -> Option<Conflict> {
         span_b: Some(ctx.b.span(*yb)),
         rule: "relabel-relabel",
     })
+}
+
+/// insert-delete (broken dependency): one branch inserted under an O
+/// node the other branch deleted. The graft has no surviving anchor to
+/// re-attach to.
+///
+/// Stricter than the plan's sketch, which softened this through
+/// node-types.json ("no surviving ancestor admits the inserted kind"):
+/// the pushout builder cannot re-anchor a graft to a different
+/// ancestor yet, so a softened rule would declare merges clean and
+/// then silently drop the insertion. Revisit together with builder
+/// re-anchoring.
+fn insert_delete(ea: &Edit, eb: &Edit, ctx: &Ctx) -> Option<Conflict> {
+    match (ea, eb) {
+        (Edit::Insert(insert), Edit::Delete(deleted)) => {
+            let (parent_o, _) = insert_anchor(ctx.a, ctx.f, *insert)?;
+            (parent_o == *deleted).then(|| Conflict {
+                span_o: Some(ctx.o.span(*deleted)),
+                span_a: Some(ctx.a.span(*insert)),
+                span_b: None,
+                rule: "insert-delete",
+            })
+        }
+        (Edit::Delete(deleted), Edit::Insert(insert)) => {
+            let (parent_o, _) = insert_anchor(ctx.b, ctx.g, *insert)?;
+            (parent_o == *deleted).then(|| Conflict {
+                span_o: Some(ctx.o.span(*deleted)),
+                span_a: None,
+                span_b: Some(ctx.b.span(*insert)),
+                rule: "insert-delete",
+            })
+        }
+        _ => None,
+    }
+}
+
+/// delete-delete (split deletion): connected regions of deleted O
+/// nodes that overlap across branches without coinciding. Each branch
+/// deleted part of something the other deleted differently — neither
+/// deletion subsumes cleanly.
+fn delete_delete(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<Conflict>) {
+    let components_a = deletion_components(ctx.o, edits_a);
+    let components_b = deletion_components(ctx.o, edits_b);
+    for ca in &components_a {
+        for cb in &components_b {
+            if ca == cb || ca.is_disjoint(cb) {
+                continue;
+            }
+            let union: Vec<NodeId> = ca.union(cb).copied().collect();
+            let conflict = Conflict {
+                span_o: covering_span(ctx.o, &union),
+                span_a: None,
+                span_b: None,
+                rule: "delete-delete",
+            };
+            if !found.contains(&conflict) {
+                found.push(conflict);
+            }
+        }
+    }
+}
+
+/// Connected components (by parent-child edges within the deleted set)
+/// of one branch's deleted O nodes.
+fn deletion_components(o: &Tree, script: &[Edit]) -> Vec<HashSet<NodeId>> {
+    let deleted: HashSet<NodeId> = script
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::Delete(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    let mut component_of: HashMap<NodeId, usize> = HashMap::new();
+    let mut components: Vec<HashSet<NodeId>> = Vec::new();
+    // Pre-order: a deleted parent's component exists before its
+    // children look it up.
+    for node in o.nodes() {
+        if !deleted.contains(&node) {
+            continue;
+        }
+        let component = o
+            .parent(node)
+            .and_then(|parent| component_of.get(&parent).copied())
+            .unwrap_or_else(|| {
+                components.push(HashSet::new());
+                components.len().saturating_sub(1)
+            });
+        if let Some(set) = components.get_mut(component) {
+            set.insert(node);
+        }
+        component_of.insert(node, component);
+    }
+    components
 }
 
 /// insert-insert: both branches inserted at the same slot — same

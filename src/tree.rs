@@ -31,9 +31,14 @@ impl NodeId {
 ///
 /// Nodes live in an arena in pre-order (the root is index 0). The lift
 /// keeps named and anonymous nodes — anonymous tokens like `+` carry
-/// meaning through their kind — but drops `extra` nodes (comments), and
-/// parsing rejects sources whose CST contains error or missing nodes:
-/// structural merge requires syntactically valid inputs.
+/// meaning through their kind. `extra` nodes (comments) are lifted as
+/// opaque leaves: the node stays, its children do not, so its label is
+/// its full source text. Opacity is what makes comment edits visible
+/// uniformly — a rust `// plain` comment's body text lives in no CST
+/// leaf, so lifting comment interiors would leave two different
+/// comments structurally identical. Parsing rejects sources whose CST
+/// contains error or missing nodes: structural merge requires
+/// syntactically valid inputs.
 #[derive(Debug)]
 pub struct Tree {
     lang: &'static Lang,
@@ -47,6 +52,7 @@ struct NodeData {
     kind: &'static str,
     kind_id: u16,
     named: bool,
+    extra: bool,
     span: Range<usize>,
     parent: Option<NodeId>,
     children: Vec<NodeId>,
@@ -110,6 +116,12 @@ impl Tree {
     /// anonymous token like `+`.
     pub fn is_named(&self, id: NodeId) -> bool {
         self.node(id).named
+    }
+
+    /// Whether the node is an `extra` (a comment): valid anywhere,
+    /// filling no grammar slot. Extras are lifted as opaque leaves.
+    pub fn is_extra(&self, id: NodeId) -> bool {
+        self.node(id).extra
     }
 
     /// All nodes in pre-order.
@@ -212,7 +224,8 @@ fn has_error_or_missing(root: tree_sitter::Node) -> bool {
     }
 }
 
-/// Lifts the CST into arena nodes, pre-order, skipping `extra` nodes.
+/// Lifts the CST into arena nodes, pre-order, keeping `extra` nodes as
+/// opaque leaves (their children are not descended into).
 ///
 /// Iterative with an explicit stack — recursing per CST level blows the
 /// call stack on deeply nested sources.
@@ -226,6 +239,7 @@ fn lift(root: tree_sitter::Node) -> Vec<NodeData> {
             kind: node.kind(),
             kind_id: node.kind_id(),
             named: node.is_named(),
+            extra: node.is_extra(),
             span: node.byte_range(),
             parent,
             children: Vec::new(),
@@ -240,16 +254,16 @@ fn lift(root: tree_sitter::Node) -> Vec<NodeData> {
                 .children
                 .push(id);
         }
+        if node.is_extra() {
+            continue;
+        }
         // Children go on the stack reversed so the leftmost child pops
         // first, giving pre-order arena indices and in-order `children`.
         let mut cursor = node.walk();
         let mut kids = Vec::new();
         if cursor.goto_first_child() {
             loop {
-                let child = cursor.node();
-                if !child.is_extra() {
-                    kids.push((child, Some(id), cursor.field_id()));
-                }
+                kids.push((cursor.node(), Some(id), cursor.field_id()));
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -295,9 +309,45 @@ mod tests {
     }
 
     #[test]
-    fn comments_are_excluded() -> Result<(), Error> {
+    fn comments_are_opaque_labeled_leaves() -> Result<(), Error> {
+        // A plain rust comment's body text lives in no CST leaf (the
+        // line_comment's only child is the `//` token), so the lift
+        // must keep the extra node itself, childless, labeled with the
+        // full comment text.
         let t = parse_rust("// hello\nfn main() {}")?;
-        assert!(t.nodes().all(|n| t.kind(n) != "line_comment"));
+        let comment = t.nodes().find(|&n| t.kind(n) == "line_comment");
+        let Some(comment) = comment else {
+            panic!("the comment is lifted");
+        };
+        assert!(t.is_extra(comment));
+        assert!(t.children(comment).is_empty());
+        assert_eq!(t.label(comment), Some("// hello"));
+        assert!(!t.is_extra(t.root()));
+        Ok(())
+    }
+
+    #[test]
+    fn doc_comment_interiors_are_not_lifted() -> Result<(), Error> {
+        // `/// doc` does carry an inner doc_comment leaf, but lifting
+        // it for doc comments only would split the representation;
+        // opacity applies to every extra.
+        let t = parse_rust("/// doc\nfn main() {}")?;
+        let comment = t.nodes().find(|&n| t.kind(n) == "line_comment");
+        assert!(comment.is_some_and(|n| t.children(n).is_empty()));
+        assert!(t.nodes().all(|n| t.kind(n) != "doc_comment"));
+        Ok(())
+    }
+
+    #[test]
+    fn comments_are_lifted_in_java_and_json() -> Result<(), Error> {
+        let t = Tree::parse("// c\nclass A { }", lang("java")?)?;
+        let comment = t.nodes().find(|&n| t.kind(n) == "line_comment");
+        assert!(comment.is_some_and(|n| t.is_extra(n)));
+        assert_eq!(comment.and_then(|n| t.label(n)), Some("// c"));
+
+        let t = Tree::parse("// c\n[1]", lang("json")?)?;
+        let comment = t.nodes().find(|&n| t.kind(n) == "comment");
+        assert!(comment.is_some_and(|n| t.is_extra(n)));
         Ok(())
     }
 

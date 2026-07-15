@@ -1094,6 +1094,24 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_edit_produces_exactly_one_relabel() -> Result<(), Error> {
+        // Comments are opaque labeled leaves, so editing one is a
+        // relabel like any rename — the edit the old trivia-only
+        // representation could not see.
+        let o = parse_rust("// old\nfn a() {}")?;
+        let a = parse_rust("// new\nfn a() {}")?;
+        let m = diff(&o, &a);
+        let script = edits(&o, &a, &m);
+        assert_eq!(script.len(), 1);
+        let relabels_comment = script.iter().any(|e| match e {
+            Edit::Relabel(s, d) => o.label(*s) == Some("// old") && a.label(*d) == Some("// new"),
+            _ => false,
+        });
+        assert!(relabels_comment, "{script:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_rename_produces_exactly_one_relabel() -> Result<(), Error> {
         let o = parse_rust("fn a() {}")?;
         let a = parse_rust("fn b() {}")?;

@@ -1496,6 +1496,71 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_edit_merges_with_a_code_edit() -> Result<(), Error> {
+        // A rewrites the comment, B renames the call: disjoint edits,
+        // both land — the merge the trivia representation silently
+        // dropped to one side.
+        let o = parse("// call the thing\nfn f() { x(); }\n", "rust")?;
+        let a = parse("// call the improved thing\nfn f() { x(); }\n", "rust")?;
+        let b = parse("// call the thing\nfn f() { y(); }\n", "rust")?;
+        match merge_to_text(&o, &a, &b)? {
+            MergeResult::Merged(text) => {
+                assert_eq!(text, "// call the improved thing\nfn f() { y(); }\n");
+            }
+            MergeResult::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_distinct_comment_edits_conflict() -> Result<(), Error> {
+        assert_conflicts(
+            "rust",
+            "// v1\nfn f() {}",
+            "// v2\nfn f() {}",
+            "// v3\nfn f() {}",
+            "relabel-relabel",
+        )?;
+        // The identical edit made twice still merges.
+        assert_merges(
+            "rust",
+            "// v1\nfn f() {}",
+            "// v2\nfn f() {}",
+            "// v2\nfn f() {}",
+            "// v2\nfn f() {}",
+        )
+    }
+
+    #[test]
+    fn a_comment_edit_under_a_deletion_conflicts() -> Result<(), Error> {
+        // A deletes fn b and its comment; B rewrites that comment.
+        // Deletion-wins would silently drop B's edit — relabel-delete
+        // now sees the comment like any other node.
+        assert_conflicts(
+            "rust",
+            "fn a() {}\n// about b\nfn b() {}\n",
+            "fn a() {}\n",
+            "fn a() {}\n// all about b\nfn b() {}\n",
+            "relabel-delete",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_inserted_comment_does_not_fire_the_arity_rule() -> Result<(), Error> {
+        // Extras fill no grammar slot and node-types.json admits them
+        // nowhere, so a changed node holding a comment child must be
+        // vetted with the comment skipped, not rejected.
+        assert_merges(
+            "rust",
+            "fn f() { x(); }",
+            "fn f() { /* note */ x(); }",
+            "fn f() { x(); }",
+            "fn f() { /* note */ x(); }",
+        )
+    }
+
+    #[test]
     fn a_wrap_pulls_the_survivor_into_the_graft() -> Result<(), Error> {
         // A wraps the array one level deeper; B leaves it alone.
         assert_merges(

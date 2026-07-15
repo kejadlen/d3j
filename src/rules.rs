@@ -286,16 +286,21 @@ fn node_satisfies(
     // child's field id travels with its origin node; a field this
     // parent kind does not define (a graft that came from a different
     // context) counts as loose so the children slot still vets it.
+    // Extras (comments) fill no grammar slot and node-types.json
+    // admits them nowhere, so they are skipped rather than vetted.
     let members: Vec<(Option<&str>, &str, bool)> = merged
         .children(id)
         .iter()
-        .map(|&child| {
+        .filter_map(|&child| {
             let (tree, node) = resolve(o, a, b, merged.origin(child));
+            if tree.is_extra(node) {
+                return None;
+            }
             let field = tree
                 .field_id(node)
                 .and_then(|fid| language.field_name_for_id(fid.get()))
                 .filter(|name| node_type.fields.contains_key(*name));
-            (field, tree.kind(node), tree.is_named(node))
+            Some((field, tree.kind(node), tree.is_named(node)))
         })
         .collect();
 

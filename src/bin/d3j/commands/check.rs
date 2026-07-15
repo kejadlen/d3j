@@ -55,13 +55,25 @@ fn witness<'t>(
     violation: &Violation,
 ) -> (&'t Tree, Range<usize>) {
     match violation {
-        Violation::ExtraInsertion { span, .. } => (m, span.clone()),
+        Violation::ExtraInsertion { span, .. } | Violation::ExtraRelabel { span, .. } => {
+            (m, span.clone())
+        }
         Violation::MissedInsertion {
+            branch: Branch::A,
+            span,
+            ..
+        }
+        | Violation::MissedRelabel {
             branch: Branch::A,
             span,
             ..
         } => (a, span.clone()),
         Violation::MissedInsertion {
+            branch: Branch::B,
+            span,
+            ..
+        }
+        | Violation::MissedRelabel {
             branch: Branch::B,
             span,
             ..

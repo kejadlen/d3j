@@ -172,14 +172,26 @@ fn merge_to_text_with(
                         branch: crate::check::Branch::A,
                         span,
                         ..
+                    }
+                    | Violation::MissedRelabel {
+                        branch: crate::check::Branch::A,
+                        span,
+                        ..
                     } => (None, Some(span.clone()), None),
                     Violation::MissedInsertion {
                         branch: crate::check::Branch::B,
                         span,
                         ..
+                    }
+                    | Violation::MissedRelabel {
+                        branch: crate::check::Branch::B,
+                        span,
+                        ..
                     } => (None, None, Some(span.clone())),
                     // The witness lives in M, which has no span slot.
-                    Violation::ExtraInsertion { .. } => (None, None, None),
+                    Violation::ExtraInsertion { .. } | Violation::ExtraRelabel { .. } => {
+                        (None, None, None)
+                    }
                 };
                 Conflict {
                     span_o,

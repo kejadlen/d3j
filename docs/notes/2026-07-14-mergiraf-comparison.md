@@ -310,10 +310,15 @@ between the pre- and post-comment builds is
 *silent* comment-dropping merge; the remaining BAD-MERGE is
 `conflicting_method_signatures`, the known signature-composition gap.
 
-Sweeping also surfaced a checker limitation worth its own follow-up:
-`d3j check` cannot see a *dropped relabel* (comment or code — a merge
-that ignores A's rename of `a` to `b` passes). The four universality
-conditions are set-membership statements over node maps; none of them
-compares labels along the routes. The merge pipeline itself conflicts
-correctly via relabel-relabel, but `check` as an external judge of
-other tools' merges is blind to this class.
+Sweeping also surfaced a checker limitation, fixed the same day: `d3j
+check` could not see a *dropped relabel* (comment or code — a merge
+that ignored A's rename of `a` to `b` passed). The four universality
+conditions were set-membership statements over node maps; none of
+them compared labels along the routes. A fifth condition now judges
+labels wherever the routes commute: a branch that relabeled a node
+must see its label in M (missed relabel), M must keep O's label when
+neither branch relabeled (extra relabel), and a branch's inserted
+nodes must arrive with their labels verbatim. The merge pipeline
+already conflicted correctly via relabel-relabel; this closes the
+gap for `check` as an external judge and tightens the pipeline's own
+self-check.

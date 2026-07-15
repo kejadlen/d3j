@@ -222,11 +222,11 @@ What landed:
 Remaining gaps the suite sweep exposed, in rough order of value:
 
 - ~~Commutative-list merging~~ — done, see the second update below.
-- Comment edits are invisible. `use crate::{foo, /* bar */}` vs
-  `/* baz */`: comments are trivia, so d3j sees two identical
-  comma-inserts, dedupes, and outputs `use crate::{foo,};` — both
-  branches' comments dropped, and mergiraf's expected conflict never
-  fires. Needs comment-aware matching or synthesis.
+- ~~Comment edits are invisible~~ — done, see the third update below
+  (2026-07-15): comments are now opaque leaf nodes, so the
+  `use crate::{foo, /* bar */}` vs `/* baz */` probe raises the
+  insert-insert conflict mergiraf expects instead of dropping both
+  comments.
 - Signature collisions via composition. mergiraf's
   `conflicting_method_signatures`: A adds a parameter to `run`, B
   renames `run` to `runNow`; the composed `runNow(Environment env)`
@@ -296,3 +296,24 @@ blanket-commutative), identical elements inserted at different slots
 comment attachment, and normalizing away a branch's insertion that
 duplicates something already in base (mergiraf drops it; d3j
 faithfully keeps the branch's edit).
+
+## Third update: comments as nodes (2026-07-15)
+
+Comments are no longer trivia: extras are lifted as opaque labeled
+leaves (see `docs/notes/2026-07-15-comment-nodes.md`), so a comment
+edit is a relabel and the relabel-relabel/relabel-delete rules cover
+concurrent comment edits. On a fresh clone of mergiraf's example
+suite (now 63 cases; the counts above used yesterday's 54-case
+snapshot and do not compare directly), the one case that changed
+between the pre- and post-comment builds is
+`use_statements_with_comments`: BAD-MERGE → OK. That was the last
+*silent* comment-dropping merge; the remaining BAD-MERGE is
+`conflicting_method_signatures`, the known signature-composition gap.
+
+Sweeping also surfaced a checker limitation worth its own follow-up:
+`d3j check` cannot see a *dropped relabel* (comment or code — a merge
+that ignores A's rename of `a` to `b` passes). The four universality
+conditions are set-membership statements over node maps; none of them
+compares labels along the routes. The merge pipeline itself conflicts
+correctly via relabel-relabel, but `check` as an external judge of
+other tools' merges is blind to this class.

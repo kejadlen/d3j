@@ -1561,6 +1561,83 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_distinct_comment_inserts_conflict() -> Result<(), Error> {
+        // The motivating probe from the mergiraf comparison: each
+        // branch appends its own comment after the comma. The runs end
+        // in a comment — a forward-binding prefix with its target
+        // outside the run — so they refuse to group and insert-insert
+        // fires, where the trivia representation deduped the two
+        // "identical" comma-inserts and dropped both comments.
+        assert_conflicts(
+            "rust",
+            "use crate::{foo};\n",
+            "use crate::{foo, /* bar */};\n",
+            "use crate::{foo, /* baz */};\n",
+            "insert-insert",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn doc_comments_travel_with_their_item_in_a_union() -> Result<(), Error> {
+        // Both branches insert a documented function at the same slot.
+        // Each comment binds forward into its function's element group,
+        // so the union cannot splice B's function between A's doc
+        // comment and A's function.
+        let o = parse("fn main() {}\n", "rust")?;
+        let a = parse("/// A.\nfn a() {}\nfn main() {}\n", "rust")?;
+        let b = parse("/// B.\nfn b() {}\nfn main() {}\n", "rust")?;
+        match merge_to_text(&o, &a, &b)? {
+            MergeResult::Merged(text) => {
+                let a_pos = text.find("/// A.");
+                let b_pos = text.find("/// B.");
+                assert!(a_pos.is_some() && b_pos.is_some(), "{text:?}");
+                let merged = parse(&text, "rust")?;
+                // Doc-comment spans include their trailing newline.
+                let order: Vec<_> = merged
+                    .nodes()
+                    .filter_map(|n| merged.label(n))
+                    .filter(|l| l.starts_with("///") || *l == "a" || *l == "b" || *l == "main")
+                    .collect();
+                assert_eq!(
+                    order,
+                    vec!["/// A.\n", "a", "/// B.\n", "b", "main"],
+                    "{text:?}"
+                );
+            }
+            MergeResult::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn identical_documented_insertions_dedupe_as_one_group() -> Result<(), Error> {
+        // The comment is part of the element group's hash sequence, so
+        // the group dedupes whole: one comment, one function.
+        assert_merges(
+            "rust",
+            "fn main() {}\n",
+            "/// Shared.\nfn util() {}\nfn main() {}\n",
+            "/// Shared.\nfn util() {}\nfn main() {}\n",
+            "/// Shared.\nfn util() {}\nfn main() {}\n",
+        )
+    }
+
+    #[test]
+    fn identical_comments_at_different_slots_merge() -> Result<(), Error> {
+        // duplicate-insert exempts extras: repeating the same marker
+        // comment in two places is not a duplicate definition, so both
+        // copies land where their branch put them.
+        assert_merges(
+            "rust",
+            "fn a() {}\nfn b() {}\n",
+            "// marker\nfn a() {}\nfn b() {}\n",
+            "fn a() {}\n// marker\nfn b() {}\n",
+            "// marker\nfn a() {}\n// marker\nfn b() {}\n",
+        )
+    }
+
+    #[test]
     fn a_wrap_pulls_the_survivor_into_the_graft() -> Result<(), Error> {
         // A wraps the array one level deeper; B leaves it alone.
         assert_merges(

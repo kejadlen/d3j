@@ -466,7 +466,9 @@ fn dedupes_together(
 /// with a `name`/`key` field, so without this rule the union merge
 /// silently lands the element twice. Separators are excluded (every
 /// comma equals every other comma); named elements are
-/// name-collision's domain.
+/// name-collision's domain. Extras are excluded too: both branches
+/// writing the same `// section` comment in different places is
+/// legitimate repetition, not a duplicate definition.
 fn duplicate_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut Vec<Conflict>) {
     let elements = |tree: &Tree, matching: &Matching, script: &[Edit]| {
         let mut map: HashMap<(NodeId, u64), Vec<(Slot, NodeId)>> = HashMap::new();
@@ -474,7 +476,7 @@ fn duplicate_insert(ctx: &Ctx, edits_a: &[Edit], edits_b: &[Edit], found: &mut V
             let Edit::Insert(node) = edit else {
                 continue;
             };
-            if !tree.is_named(*node) || node_name(tree, *node).is_some() {
+            if !tree.is_named(*node) || tree.is_extra(*node) || node_name(tree, *node).is_some() {
                 continue;
             }
             let Some(slot) = insert_anchor(tree, matching, *node) else {
@@ -572,17 +574,22 @@ fn insert_slots(tree: &Tree, matching: &Matching, script: &[Edit]) -> HashMap<Sl
 /// node together with the anonymous separators and forward-binding
 /// prefixes preceding it (a JSON insertion is `, "k": v` — the comma
 /// travels with its pair; a Rust `#[attr]` travels with the item it
-/// governs). `None` when trailing prefix nodes remain: a separator
-/// with no element cannot participate in a union merge, and a
-/// trailing attribute governs something *outside* the run, which a
-/// union would displace. Group-wise dedupe in the builder relies on
-/// the same decomposition.
+/// governs). Extras bind forward too: a standalone comment describes
+/// the item below it, and a union must not splice the other branch's
+/// code between a doc comment and its function. `None` when trailing
+/// prefix nodes remain: a separator with no element cannot participate
+/// in a union merge, and a trailing attribute or comment governs
+/// something *outside* the run, which a union would displace.
+/// Group-wise dedupe in the builder relies on the same decomposition.
 pub(crate) fn element_groups(tree: &Tree, run: &[NodeId]) -> Option<Vec<Vec<NodeId>>> {
     let mut groups = Vec::new();
     let mut current = Vec::new();
     for &node in run {
         current.push(node);
-        if tree.is_named(node) && !tree.lang().binds_forward(tree.kind(node)) {
+        if tree.is_named(node)
+            && !tree.is_extra(node)
+            && !tree.lang().binds_forward(tree.kind(node))
+        {
             groups.push(std::mem::take(&mut current));
         }
     }

@@ -1018,6 +1018,27 @@ mod tests {
         };
         assert!(conflicts.iter().any(|c| c.span_b.is_some()));
 
+        // Missed relabel from A: A renamed 1 to 2, the fake output
+        // kept 1.
+        let o = parse("[1]", "json")?;
+        let a = parse("[2]", "json")?;
+        let b = parse("[1]", "json")?;
+        let result = merge_to_text_with(&o, &a, &b, |_, _, _, _| "[1]".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected self-check conflicts");
+        };
+        assert!(conflicts.iter().any(|c| c.span_a.is_some()));
+
+        // Missed relabel from B, symmetrically.
+        let o = parse("[1]", "json")?;
+        let a = parse("[1]", "json")?;
+        let b = parse("[2]", "json")?;
+        let result = merge_to_text_with(&o, &a, &b, |_, _, _, _| "[1]".into())?;
+        let MergeResult::Conflicts(conflicts) = result else {
+            panic!("expected self-check conflicts");
+        };
+        assert!(conflicts.iter().any(|c| c.span_b.is_some()));
+
         // Extra insertion: nobody wrote 9; the witness lives in M, so
         // no span slot is filled.
         let o = parse("[1]", "json")?;

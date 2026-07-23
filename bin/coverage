@@ -5,6 +5,11 @@
 # normal build artifacts never mix — mixing causes phantom uncovered
 # lines. Override the gate with COVERAGE_THRESHOLD (defaults to 100).
 #
+# `#[cfg(test)]` modules are excluded from measurement (they sit at
+# the tail of each file, so the unterminated excl-start runs to EOF):
+# their panic! arms and `?` branches never run in a passing suite and
+# would force a lowered gate for lines that are not library code.
+#
 # Scaffolded into a project as bin/coverage; the `coverage` justfile
 # recipe runs it. See the rust skill's coverage.md and scaffolding.md.
 
@@ -33,7 +38,7 @@ main() {
         --keep-only 'src/**' \
         --ignore 'src/bin/**' \
         --excl-line 'cov-excl-line|unreachable!' \
-        --excl-start 'cov-excl-start' \
+        --excl-start 'cov-excl-start|#\[cfg\(test\)\]' \
         --excl-stop 'cov-excl-stop')
 
     # Per-file breakdown: walk the covdir tree, printing leaf files only.

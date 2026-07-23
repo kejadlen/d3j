@@ -895,6 +895,44 @@ mod tests {
     }
 
     #[test]
+    fn candidate_with_a_crossing_sibling_image_is_inadmissible() -> Result<(), Error> {
+        // src's "1" sits before the candidate "2", but its image lands
+        // after cy inside a nested array — a crossing only the src-side
+        // sibling-order check can see, since the image is not a sibling
+        // of cy on the dst side.
+        let src = parse_json("[1, 2]")?;
+        let dst = parse_json("[2, [1]]")?;
+        let (Some(s1), Some(d1)) = (find_number(&src, "1"), find_number(&dst, "1")) else {
+            unreachable!("both sources hold a number 1");
+        };
+        let (Some(cx), Some(cy)) = (find_number(&src, "2"), find_number(&dst, "2")) else {
+            unreachable!("both sources hold a number 2");
+        };
+        let mut m = Matching::new(&src, &dst);
+        m.insert(s1, d1);
+        assert!(!admissible(&src, &dst, &m, cx, cy));
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_with_sibling_images_in_order_is_admissible() -> Result<(), Error> {
+        // Same shape as the crossing case, but the nested "1" stays on
+        // the same side of the candidate as its preimage.
+        let src = parse_json("[1, 2]")?;
+        let dst = parse_json("[[1], 2]")?;
+        let (Some(s1), Some(d1)) = (find_number(&src, "1"), find_number(&dst, "1")) else {
+            unreachable!("both sources hold a number 1");
+        };
+        let (Some(cx), Some(cy)) = (find_number(&src, "2"), find_number(&dst, "2")) else {
+            unreachable!("both sources hold a number 2");
+        };
+        let mut m = Matching::new(&src, &dst);
+        m.insert(s1, d1);
+        assert!(admissible(&src, &dst, &m, cx, cy));
+        Ok(())
+    }
+
+    #[test]
     fn insert_relinks_stale_pairs() -> Result<(), Error> {
         // Bijectivity is structural: re-inserting either endpoint
         // unlinks the pairing it replaces.

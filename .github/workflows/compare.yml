@@ -1,0 +1,58 @@
+name: Comparison site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - compare/**
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/compare.yml
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialize deploys; don't cancel a deployment already in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MERGIRAF_VERSION: 0.18.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build d3j
+        run: cargo build --release
+      - name: Install mergiraf
+        # Compiles from source (a couple of minutes); pinned for
+        # reproducible output.
+        run: cargo install mergiraf --locked --version "$MERGIRAF_VERSION"
+      - name: Generate site
+        env:
+          D3J: ${{ github.workspace }}/target/release/d3j
+        run: ./compare/generate.sh dist
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # deploy to Pages.
+      id-token: write # OIDC token for the Pages deployment.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

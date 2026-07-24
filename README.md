@@ -22,15 +22,12 @@ any tree-sitter grammar, and ships with Rust, Java, and JSON.
 
 ## Status
 
-Early development. The crate is scaffolded and two pieces are in place:
-
-- the language registry (`Lang`), which detects a grammar by file
-  extension and loads its `node-types.json` metadata
-- the library-wide error space (`Error`)
-
-The diff, merge, checker, and synthesis stages — and the working
-CLI — are not built yet. The command-line interface described below is
-the planned shape, not a working one. See
+Early development, but the pipeline works end to end: parsing, the
+arena AST, base-to-branch diffing, the pushout merge, the correctness
+checker, output synthesis, and the `d3j` CLI are all in place for the
+bundled grammars (Rust, Java, JSON). Move detection, deeper Java
+conflict rules, and evaluation against the paper's replication
+datasets are still to come. See
 [`docs/plans/2026-07-10-d3j-design.md`](docs/plans/2026-07-10-d3j-design.md)
 for the full design and milestones.
 
@@ -67,7 +64,7 @@ To install the `d3j` binary:
 just install    # cargo install --locked --path .
 ```
 
-## Usage (planned)
+## Usage
 
 The binary takes diff3-style argument order, so it drops into a
 merge-driver configuration:
@@ -83,6 +80,40 @@ Both exit 2 on unparsable input or an unknown language — d3j never
 silently falls back to a textual merge. Language is detected from the
 file extension, with `--lang` as an override.
 
+## Using with jj
+
+d3j plugs into [Jujutsu](https://jj-vcs.dev) as a merge tool. With the
+binary installed, add this to your jj config (`jj config edit --user`):
+
+```toml
+[merge-tools.d3j]
+program = "d3j"
+merge-args = ["merge", "$base", "$left", "$right", "-o", "$output"]
+merge-conflict-exit-codes = [1]
+conflict-marker-style = "git"
+```
+
+Then resolve conflicts with it:
+
+```sh
+jj resolve --tool d3j                   # all conflicted files
+jj resolve --tool d3j 'glob:**/*.rs'    # scope to one language
+```
+
+jj hands d3j temporary copies of the three sides (the files keep their
+extension, so language detection works) and reads the merged result
+back from `$output`. `merge-conflict-exit-codes` (jj ≥ 0.24) tells jj
+that exit 1 means the output still contains conflict markers, which jj
+parses back into its own conflict state; `conflict-marker-style =
+"git"` matches the diff3-style markers d3j emits. Exit 2 is
+deliberately not listed: an unparsable file or unknown language is a
+tool failure, and jj leaves the conflict untouched.
+
+Because only Rust, Java, and JSON grammars are bundled, scoping
+`jj resolve` with a fileset is the smoothest workflow — files in other
+languages fail with exit 2. Keep `ui.merge-editor` pointed at an
+interactive editor and reach for `--tool d3j` explicitly.
+
 ## Development
 
 The `justfile` wraps the common tasks:
@@ -96,6 +127,13 @@ just mutants    # mutation testing
 
 CI runs formatting, clippy, coverage, and mutation testing on every push
 and pull request.
+
+## Releases
+
+Pushing a `v*` tag triggers the release workflow, which builds macOS
+(aarch64) and Linux (aarch64) binaries, creates a GitHub release with
+generated notes, and publishes a [DotSlash](https://dotslash-cli.com)
+file for the release.
 
 ## Reference
 

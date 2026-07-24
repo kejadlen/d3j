@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build macOS
+        run: |
+          cargo build --release
+          tar -czf d3j-aarch64-apple-darwin.tar.gz -C target/release d3j
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d3j-aarch64-apple-darwin
+          path: d3j-aarch64-apple-darwin.tar.gz
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build Linux
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+          cross build --release --target aarch64-unknown-linux-gnu
+          tar -czf d3j-aarch64-unknown-linux-gnu.tar.gz -C target/aarch64-unknown-linux-gnu/release d3j
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: d3j-aarch64-unknown-linux-gnu
+          path: d3j-aarch64-unknown-linux-gnu.tar.gz
+
+  publish:
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          merge-multiple: true
+
+      - name: Publish
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            d3j-aarch64-apple-darwin.tar.gz \
+            d3j-aarch64-unknown-linux-gnu.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  dotslash:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # dotslash-publish-release needs credentials to push a commit.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: facebook/dotslash-publish-release@2539c4d8ae00a42773306c8731d2dd3724d979d2 # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config: .github/workflows/dotslash-config.json
+          tag: ${{ github.ref_name }}

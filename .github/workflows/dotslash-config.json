@@ -1,0 +1,18 @@
+{
+  "outputs": {
+    "d3j": {
+      "platforms": {
+        "macos-aarch64": {
+          "regex": "^d3j-aarch64-apple-darwin",
+          "format": "tar.gz",
+          "path": "d3j"
+        },
+        "linux-aarch64": {
+          "regex": "^d3j-aarch64-unknown-linux-gnu",
+          "format": "tar.gz",
+          "path": "d3j"
+        }
+      }
+    }
+  }
+}

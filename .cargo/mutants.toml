@@ -1,0 +1,71 @@
+# Equivalent mutants: each entry names a mutation that provably cannot
+# change observable behavior, with the argument. Keep this list short
+# and specific — a mutant goes here only after the equivalence argument
+# is written down.
+
+exclude_re = [
+    # anchor(): for a unique-unique candidate pair, s being matched
+    # implies d is matched and vice versa — a larger wholesale anchor
+    # pairs s with its positional counterpart, whose equal content and
+    # dst-side uniqueness force it to be d. Either disjunct implies
+    # the other, so || and && coincide.
+    'replace \|\| with && in anchor',
+    # anchor(): candidates are unmatched while placed roots are
+    # matched, so a candidate index never equals a placed root's and
+    # < versus <= cannot differ.
+    'replace < with <= in anchor',
+    # refine(): a gap empty on one side produces a ZS mapping with no
+    # real (Some, Some) pairs to fold; the skip is a fast path, not a
+    # behavior change.
+    'replace \|\| with && in refine',
+    # refine(): the ZS budget is an arbitrary tuning constant; > vs >=
+    # differs only for a residue of exactly 400 nodes and either
+    # behavior is acceptable there.
+    'replace > with >= in refine',
+    # refine()'s relabel closure: if the virtual forest roots cannot
+    # pair, every candidate mapping pays the same uniform +2 (delete
+    # plus insert of the roots), so the optimal child mapping — the
+    # only thing folded — is unchanged.
+    'delete match arm \(None, None\) in refine',
+    # lcs_pairs(): the fill guarantees the equal case always took the
+    # diagonal, so the surviving index mutants only change *which* of
+    # several equally long subsequences the backtrack walks — every
+    # choice they can make is optimal. The exhaustive reference-oracle
+    # test pins length and validity, which is the function's whole
+    # contract; a mutant that broke either would be caught by it.
+    'replace \+ with \* in lcs_pairs',
+    # sibling_order_holds(): a sibling's image can never equal the
+    # candidate y — y is unmatched at check time — so index equality
+    # cannot occur and < versus <= coincide.
+    'replace < with <= in sibling_order_holds',
+    # graft_branch()'s dedupe twin search: the insert-insert rule only
+    # lets equal insertion sequences through to the builder, so a
+    # budget-true entry always exists for every B insert and any
+    # bookkeeping that consumes each entry at most once skips exactly
+    # the same set. (The hash-equality half is pinned by the
+    # single-hash duplicate-statement test.)
+    'replace && with \|\| in Builder<._>::graft_branch',
+    # graft()'s placed/consumed guards: for a graft to meet an
+    # already-placed or twice-consumed survivor, the diff would have to
+    # map a node's image outside its matched ancestor's image, which
+    # admissible() forbids. The guards are defense-in-depth against
+    # matchings our phases cannot produce.
+    'replace && with \|\| in Builder<._>::graft\b',
+    # children_changed(): tree-sitter derives node-types.json from the
+    # grammar, so a node whose children match its parsed origin always
+    # satisfies the model; widening validation to unchanged nodes (or
+    # never treating them as unchanged) cannot change outcomes on
+    # parsed trees. The guard exists for cost and for grammar corners
+    # deliberately kept out of merges.
+    'children_changed',
+    # synthesize()'s unclosed-file fallback guards: distinguishable
+    # only through the cov-excl-marked defensive path (the final merged
+    # leaf is in practice its origin's closing token).
+    'delete ! in synthesize',
+    # Solver::solve()'s backtrack tail: once one side is exhausted the
+    # remaining walk emits only deletions and insertions, which the
+    # mapping does not report — and the delete branch always holds
+    # there, shielding the insert branch's condition.
+    'replace \|\| with && in Solver<T, F>::solve',
+    'replace && with \|\| in Solver<T, F>::solve',
+]

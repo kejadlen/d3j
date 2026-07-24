@@ -14,6 +14,8 @@ pub struct Lang {
     name: &'static str,
     language: tree_sitter::Language,
     node_types: NodeTypes,
+    commutative: &'static [&'static str],
+    binds_forward: &'static [&'static str],
 }
 
 impl Lang {
@@ -59,7 +61,33 @@ impl Lang {
         &self.node_types
     }
 
-    fn new(name: &'static str, language: tree_sitter::Language, node_types_json: &str) -> Self {
+    /// Whether children of `kind` are order-insensitive: imports, use
+    /// declarations, top-level items, type members, JSON object
+    /// entries. Concurrent insertions at one slot under such a parent
+    /// merge as a union instead of conflicting. Kinds whose child
+    /// order carries meaning (statement blocks, arrays, parameter
+    /// lists) must stay off this list.
+    pub fn is_commutative(&self, kind: &str) -> bool {
+        self.commutative.contains(&kind)
+    }
+
+    /// Whether a node of `kind` semantically attaches to the sibling
+    /// that follows it — a Rust attribute governs the next item even
+    /// though the tree makes them siblings. Merging must not splice
+    /// other content between such a node and its target: a union merge
+    /// interleaving another branch's insertions would silently move
+    /// the attribute onto someone else's code.
+    pub fn binds_forward(&self, kind: &str) -> bool {
+        self.binds_forward.contains(&kind)
+    }
+
+    fn new(
+        name: &'static str,
+        language: tree_sitter::Language,
+        node_types_json: &str,
+        commutative: &'static [&'static str],
+        binds_forward: &'static [&'static str],
+    ) -> Self {
         // `node_types_json` is the grammar crate's own bundled NODE_TYPES
         // constant, not external input — a parse failure here means the
         // grammar crate shipped malformed JSON, a build-time invariant
@@ -71,6 +99,8 @@ impl Lang {
             name,
             language,
             node_types,
+            commutative,
+            binds_forward,
         }
     }
 }
@@ -80,6 +110,16 @@ static RUST: LazyLock<Lang> = LazyLock::new(|| {
         "rust",
         tree_sitter_rust::LANGUAGE.into(),
         tree_sitter_rust::NODE_TYPES,
+        // declaration_list is mod/impl/trait bodies; struct fields and
+        // enum variants stay ordered (layout and discriminants).
+        &[
+            "source_file",
+            "declaration_list",
+            "use_list",
+            "trait_bounds",
+        ],
+        // An outer attribute governs the item that follows it.
+        &["attribute_item"],
     )
 });
 
@@ -88,6 +128,20 @@ static JAVA: LazyLock<Lang> = LazyLock::new(|| {
         "java",
         tree_sitter_java::LANGUAGE.into(),
         tree_sitter_java::NODE_TYPES,
+        // program covers package/import/type declarations; type_list
+        // is implements/permits clauses and throws is checked
+        // exceptions — order carries no meaning in either. Enum bodies
+        // stay ordered (ordinal values).
+        &[
+            "program",
+            "class_body",
+            "interface_body",
+            "type_list",
+            "throws",
+        ],
+        // Java annotations live inside the declaration they annotate,
+        // not beside it, so nothing binds forward.
+        &[],
     )
 });
 
@@ -96,6 +150,9 @@ static JSON: LazyLock<Lang> = LazyLock::new(|| {
         "json",
         tree_sitter_json::LANGUAGE.into(),
         tree_sitter_json::NODE_TYPES,
+        // Objects only: array order is data.
+        &["object"],
+        &[],
     )
 });
 
@@ -123,6 +180,33 @@ impl NodeTypes {
     /// grammar defines it.
     pub fn get(&self, kind: &str) -> Option<&NodeType> {
         self.by_kind.get(kind)
+    }
+
+    /// Whether `allowed` admits a child of `kind`, expanding supertype
+    /// entries (like rust's `_expression`) through their subtypes.
+    pub fn admits(&self, allowed: &[TypeRef], kind: &str) -> bool {
+        let mut seen: Vec<&str> = Vec::new();
+        self.admits_inner(allowed, kind, &mut seen)
+    }
+
+    fn admits_inner<'s>(
+        &'s self,
+        allowed: &'s [TypeRef],
+        kind: &str,
+        seen: &mut Vec<&'s str>,
+    ) -> bool {
+        allowed.iter().any(|type_ref| {
+            if type_ref.kind == kind {
+                return true;
+            }
+            if seen.iter().any(|&visited| visited == type_ref.kind) {
+                return false;
+            }
+            seen.push(&type_ref.kind);
+            self.by_kind
+                .get(&type_ref.kind)
+                .is_some_and(|node_type| self.admits_inner(&node_type.subtypes, kind, seen))
+        })
     }
 
     fn parse(json: &str) -> Result<Self, serde_json::Error> {
@@ -296,6 +380,28 @@ mod tests {
     }
 
     #[test]
+    fn admits_expands_nested_supertypes() {
+        // rust's block admits statements whose literals sit two
+        // supertype hops away (_expression → _literal → ...), so the
+        // expansion must survive visiting several supertype entries.
+        let node_types = Lang::by_name("rust").map(Lang::node_types);
+        let block_types = node_types
+            .and_then(|nt| nt.get("block"))
+            .and_then(|t| t.children.as_ref())
+            .map(|slot| slot.types.as_slice());
+        let admits = |kind: &str| {
+            node_types
+                .zip(block_types)
+                .is_some_and(|(nt, types)| nt.admits(types, kind))
+        };
+        assert!(admits("integer_literal"));
+        assert!(admits("string_literal"));
+        assert!(admits("expression_statement"));
+        assert!(!admits("no_such_kind"));
+        assert!(!admits("source_file"));
+    }
+
+    #[test]
     fn supertype_subtypes_are_loaded() {
         let has_const_item = Lang::by_name("rust").map(|lang| {
             lang.node_types()
@@ -309,6 +415,32 @@ mod tests {
     fn language_accessor_exposes_grammar() {
         let node_kind_count = Lang::by_name("json").map(|lang| lang.language().node_kind_count());
         assert!(node_kind_count.is_some_and(|count| count > 0));
+    }
+
+    #[test]
+    fn commutative_parents_are_per_language() {
+        let commutative = |lang: &str, kind: &str| {
+            Lang::by_name(lang).is_some_and(|lang| lang.is_commutative(kind))
+        };
+        assert!(commutative("rust", "source_file"));
+        assert!(commutative("rust", "use_list"));
+        assert!(commutative("rust", "trait_bounds"));
+        assert!(!commutative("rust", "block"));
+        assert!(commutative("java", "class_body"));
+        assert!(commutative("java", "type_list"));
+        assert!(!commutative("java", "block"));
+        assert!(commutative("json", "object"));
+        assert!(!commutative("json", "array"));
+    }
+
+    #[test]
+    fn forward_binding_kinds_are_per_language() {
+        let binds = |lang: &str, kind: &str| {
+            Lang::by_name(lang).is_some_and(|lang| lang.binds_forward(kind))
+        };
+        assert!(binds("rust", "attribute_item"));
+        assert!(!binds("rust", "function_item"));
+        assert!(!binds("java", "annotation"));
     }
 
     #[test]

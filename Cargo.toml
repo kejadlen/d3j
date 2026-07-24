@@ -9,6 +9,7 @@ path = "src/bin/d3j/main.rs"
 
 [dependencies]
 clap = { version = "*", features = ["derive", "env"] }
+clap_complete = "*"
 fs-err = "*"
 miette = { version = "*", features = ["fancy"] }
 serde = { version = "*", features = ["derive"] }

@@ -316,6 +316,7 @@ mod tests {
         // must be a bijection. Kills backtrack mutants that hand-picked
         // cases let through.
         let labels = [0u8, 1u8];
+        assert!(trees_with(0, &labels).is_empty());
         let mut all: Vec<(ZsTree<(usize, u8)>, usize)> = Vec::new();
         for nodes in 1..=3usize {
             for tree in trees_with(nodes, &labels) {

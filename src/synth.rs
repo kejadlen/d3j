@@ -205,9 +205,7 @@ mod tests {
         let b = parse(b, lang)?;
         match merge(&o, &a, &b)? {
             MergeOutcome::Merged(m) => Ok(synthesize(&m, &o, &a, &b)),
-            MergeOutcome::Conflicts(conflicts) => {
-                panic!("expected a clean merge, got conflicts: {conflicts:?}");
-            }
+            MergeOutcome::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
         }
     }
 

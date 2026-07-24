@@ -1141,9 +1141,9 @@ mod tests {
         let m = diff(&o, &a);
         let script = edits(&o, &a, &m);
         assert_eq!(script.len(), 1);
-        let relabels_comment = script.iter().any(|e| match e {
-            Edit::Relabel(s, d) => o.label(*s) == Some("// old") && a.label(*d) == Some("// new"),
-            _ => false,
+        let relabels_comment = script.iter().any(|e| {
+            matches!(e, Edit::Relabel(s, d)
+                if o.label(*s) == Some("// old") && a.label(*d) == Some("// new"))
         });
         assert!(relabels_comment, "{script:?}");
         Ok(())
@@ -1169,10 +1169,9 @@ mod tests {
         // The number 2 and its separating comma arrive as inserts;
         // nothing is deleted or relabeled.
         assert!(script.iter().all(|e| matches!(e, Edit::Insert(_))));
-        let inserted_number = script.iter().any(|e| match e {
-            Edit::Insert(n) => a.label(*n) == Some("2"),
-            _ => false,
-        });
+        let inserted_number = script
+            .iter()
+            .any(|e| matches!(e, Edit::Insert(n) if a.label(*n) == Some("2")));
         assert!(inserted_number);
 
         let reversed = edits(&a, &o, &diff(&a, &o));
@@ -1316,9 +1315,10 @@ mod tests {
                     assert_eq!(xs.get(*i), ys.get(*j), "LCS({xs:?}, {ys:?})");
                 }
                 for window in pairs.windows(2) {
-                    if let [(i1, j1), (i2, j2)] = window {
-                        assert!(i1 < i2 && j1 < j2, "LCS({xs:?}, {ys:?}) crosses: {pairs:?}");
-                    }
+                    let [(i1, j1), (i2, j2)] = window else {
+                        unreachable!("windows(2) yields pairs");
+                    };
+                    assert!(i1 < i2 && j1 < j2, "LCS({xs:?}, {ys:?}) crosses: {pairs:?}");
                 }
             }
         }

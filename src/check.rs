@@ -287,9 +287,9 @@ mod tests {
         );
         // The 9 itself is among the witnesses.
         let m = parse_json("[1, 9]")?;
-        let witnesses_nine = report.violations.iter().any(|v| match v {
-            Violation::ExtraInsertion { span, .. } => m.source_slice(span.clone()) == Some("9"),
-            _ => false,
+        let witnesses_nine = report.violations.iter().any(|v| {
+            matches!(v, Violation::ExtraInsertion { span, .. }
+                if m.source_slice(span.clone()) == Some("9"))
         });
         assert!(witnesses_nine);
         Ok(())
@@ -381,9 +381,9 @@ mod tests {
         )));
         // The witness is A's new label.
         let a = parse_json("[2]")?;
-        assert!(report.violations.iter().any(|v| match v {
-            Violation::MissedRelabel { span, .. } => a.source_slice(span.clone()) == Some("2"),
-            _ => false,
+        assert!(report.violations.iter().any(|v| {
+            matches!(v, Violation::MissedRelabel { span, .. }
+                if a.source_slice(span.clone()) == Some("2"))
         }));
         // The merge that lands the rename passes.
         let report = check_json("[1]", "[2]", "[1]", "[2]")?;
@@ -434,9 +434,9 @@ mod tests {
         let report = check_json("[1]", "[1]", "[1]", "[9]")?;
         assert!(!report.violations.is_empty());
         let m = parse_json("[9]")?;
-        assert!(report.violations.iter().any(|v| match v {
-            Violation::ExtraRelabel { span, .. } => m.source_slice(span.clone()) == Some("9"),
-            _ => false,
+        assert!(report.violations.iter().any(|v| {
+            matches!(v, Violation::ExtraRelabel { span, .. }
+                if m.source_slice(span.clone()) == Some("9"))
         }));
         Ok(())
     }
@@ -560,15 +560,10 @@ mod tests {
             r#"{"a": 1, "b": 2, "d": 4}"#,
         )?;
         assert!(!report.violations.is_empty());
-        assert!(report.violations.iter().any(|v| match v {
-            Violation::ExtraInsertion { span, .. } => {
-                let m = parse_json(r#"{"a": 1, "b": 2, "d": 4}"#);
-                m.is_ok_and(|m| {
-                    m.source_slice(span.clone())
-                        .is_some_and(|s| s.contains("4"))
-                })
-            }
-            _ => false,
+        let m = parse_json(r#"{"a": 1, "b": 2, "d": 4}"#)?;
+        assert!(report.violations.iter().any(|v| {
+            matches!(v, Violation::ExtraInsertion { span, .. }
+                if m.source_slice(span.clone()).is_some_and(|s| s.contains("4")))
         }));
         Ok(())
     }
@@ -579,12 +574,10 @@ mod tests {
         // element (and its comma) both branches kept flags the comma
         // too — the exemption must not reach it.
         let report = check_json("[1, 2]", "[1, 2]", "[1, 2]", "[1]")?;
-        let flags_comma = report.violations.iter().any(|v| match v {
-            Violation::ExtraDeletion { span, .. } => {
-                let o = parse_json("[1, 2]");
-                o.is_ok_and(|o| o.source_slice(span.clone()) == Some(","))
-            }
-            _ => false,
+        let o = parse_json("[1, 2]")?;
+        let flags_comma = report.violations.iter().any(|v| {
+            matches!(v, Violation::ExtraDeletion { span, .. }
+                if o.source_slice(span.clone()) == Some(","))
         });
         assert!(flags_comma, "{:?}", report.violations);
         Ok(())

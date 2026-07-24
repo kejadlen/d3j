@@ -5,10 +5,14 @@
 # normal build artifacts never mix — mixing causes phantom uncovered
 # lines. Override the gate with COVERAGE_THRESHOLD (defaults to 100).
 #
-# `#[cfg(test)]` modules are excluded from measurement (they sit at
-# the tail of each file, so the unterminated excl-start runs to EOF):
-# their panic! arms and `?` branches never run in a passing suite and
-# would force a lowered gate for lines that are not library code.
+# Test modules are measured too — that is what proves the tests
+# themselves run. Two line patterns are excluded because a passing
+# suite can never execute them: `panic!` lines (test-failure
+# diagnostics; the clippy panic lint keeps panic! out of library
+# code), and a lone `)?;` closing a multi-line fallible call (LLVM
+# attributes only the `?` error-branch region to that line, so it
+# reads uncovered exactly when the call never fails — the same
+# region on a single-line call is invisible to line coverage).
 #
 # Scaffolded into a project as bin/coverage; the `coverage` justfile
 # recipe runs it. See the rust skill's coverage.md and scaffolding.md.
@@ -37,8 +41,8 @@ main() {
         --ignore-not-existing \
         --keep-only 'src/**' \
         --ignore 'src/bin/**' \
-        --excl-line 'cov-excl-line|unreachable!' \
-        --excl-start 'cov-excl-start|#\[cfg\(test\)\]' \
+        --excl-line 'cov-excl-line|unreachable!|panic!|^\s*\)\?;$' \
+        --excl-start 'cov-excl-start' \
         --excl-stop 'cov-excl-stop')
 
     # Per-file breakdown: walk the covdir tree, printing leaf files only.

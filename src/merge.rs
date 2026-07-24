@@ -553,9 +553,7 @@ mod tests {
             MergeOutcome::Merged(m) => {
                 assert_eq!(m.shape(&o, &a, &b), Shape::of(&expected));
             }
-            MergeOutcome::Conflicts(conflicts) => {
-                panic!("expected a clean merge, got conflicts: {conflicts:?}");
-            }
+            MergeOutcome::Conflicts(conflicts) => panic!("unexpected conflicts: {conflicts:?}"),
         }
         let report = check::check(&o, &a, &b, &expected);
         assert!(report.is_correct(), "{:?}", report.violations);
@@ -675,9 +673,7 @@ mod tests {
         let a = parse(a, lang)?;
         let b = parse(b, lang)?;
         match merge(&o, &a, &b)? {
-            MergeOutcome::Merged(m) => {
-                panic!("expected conflicts, got a merge: {:?}", m.shape(&o, &a, &b));
-            }
+            MergeOutcome::Merged(m) => panic!("unexpected merge: {:?}", m.shape(&o, &a, &b)),
             MergeOutcome::Conflicts(conflicts) => {
                 assert!(
                     conflicts.iter().any(|c| c.rule == rule),

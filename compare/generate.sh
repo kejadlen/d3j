@@ -6,15 +6,18 @@ if [[ "${TRACE-0}" == "1" ]]; then
 fi
 
 # Renders a static comparison site: for every scenario under scenarios/,
-# run mergiraf and d3j on the base/left/right inputs and show their
-# merged outputs side by side. Both tools are located via PATH by
-# default; override with the MERGIRAF and D3J environment variables (for
-# example, D3J=target/release/d3j to use a local build).
+# run diff3, mergiraf, and d3j on the base/left/right inputs and show
+# their merged outputs side by side. diff3 is the line-based baseline
+# that structural merge exists to improve on. All three tools are
+# located via PATH by default; override with the DIFF3, MERGIRAF, and
+# D3J environment variables (for example, D3J=target/release/d3j to use
+# a local build).
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCENARIOS_DIR="$SCRIPT_DIR/scenarios"
 ASSETS_DIR="$SCRIPT_DIR/assets"
 
+DIFF3="${DIFF3:-diff3}"
 MERGIRAF="${MERGIRAF:-mergiraf}"
 D3J="${D3J:-d3j}"
 
@@ -22,10 +25,13 @@ html_escape() {
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
-# Runs a merge tool, writing merged output to $4 and echoing a status
-# word (clean, conflict, error, pending, or unavailable) to stdout.
+# Runs a merge tool with the given arguments, writing merged output to
+# $2 and echoing a status word (clean, conflict, error, pending, or
+# unavailable) to stdout. All three tools share the exit-code convention
+# 0 = clean, 1 = conflict, 2 = trouble.
 run_tool() {
-    local tool="$1" base="$2" left="$3" right="$4" out="$5"
+    local tool="$1" out="$2"
+    shift 2
     if ! command -v "$tool" >/dev/null 2>&1 && [[ ! -x "$tool" ]]; then
         : >"$out"
         echo "unavailable"
@@ -33,7 +39,7 @@ run_tool() {
     fi
 
     local rc=0
-    "$tool" merge "$base" "$left" "$right" >"$out" 2>/dev/null || rc=$?
+    "$tool" "$@" >"$out" 2>/dev/null || rc=$?
 
     if grep -q '<<<<<<<' "$out"; then
         echo "conflict"
@@ -51,6 +57,19 @@ run_tool() {
 status_badge() {
     local status="$1"
     printf '<span class="badge badge-%s">%s</span>' "$status" "$status"
+}
+
+# Emits a merged-output figure for one tool, with a placeholder when the
+# tool produced nothing to show.
+output_block() {
+    local label="$1" status="$2" path="$3"
+    printf '<figure class="code"><figcaption>%s %s</figcaption><pre>' "$label" "$(status_badge "$status")"
+    case "$status" in
+    pending) printf '<span class="muted">no merge yet — %s has no working CLI</span>' "$label" ;;
+    unavailable) printf '<span class="muted">%s binary not found</span>' "$label" ;;
+    *) html_escape <"$path" ;;
+    esac
+    printf '</pre></figure>\n'
 }
 
 # Emits a labelled <pre> block holding an escaped file's contents.
@@ -106,12 +125,15 @@ render_scenario() {
     right=$(echo "$dir"/right.*)
     ext="${base##*.}"
 
-    local mg_out d3_out
+    local df_out mg_out d3_out
+    df_out=$(mktemp)
     mg_out=$(mktemp)
     d3_out=$(mktemp)
-    local mg_status d3_status
-    mg_status=$(run_tool "$MERGIRAF" "$base" "$left" "$right" "$mg_out")
-    d3_status=$(run_tool "$D3J" "$base" "$left" "$right" "$d3_out")
+    local df_status mg_status d3_status
+    # diff3 takes MYFILE OLDFILE YOURFILE, so base goes in the middle.
+    df_status=$(run_tool "$DIFF3" "$df_out" -m -L left -L base -L right "$left" "$base" "$right")
+    mg_status=$(run_tool "$MERGIRAF" "$mg_out" merge "$base" "$left" "$right")
+    d3_status=$(run_tool "$D3J" "$d3_out" merge "$base" "$left" "$right")
 
     local agree
     if [[ "$d3_status" == "pending" || "$d3_status" == "unavailable" ]]; then
@@ -123,7 +145,7 @@ render_scenario() {
     fi
 
     {
-        page_head "$name — d3j vs. mergiraf" "style.css"
+        page_head "$name — d3j vs. mergiraf vs. diff3" "style.css"
         printf '<p class="crumb"><a href="index.html">&larr; all scenarios</a></p>\n'
         printf '<h1>%s <span class="lang">%s</span></h1>\n' "$name" "$ext"
         if [[ -f "$dir/notes.md" ]]; then
@@ -138,19 +160,11 @@ render_scenario() {
         code_block "right" "$right"
         printf '</div>\n'
 
-        printf '<h2>Merged output</h2>\n<div class="grid grid-2">\n'
-        printf '<figure class="code"><figcaption>mergiraf %s</figcaption><pre>' "$(status_badge "$mg_status")"
-        html_escape <"$mg_out"
-        printf '</pre></figure>\n'
-        printf '<figure class="code"><figcaption>d3j %s</figcaption><pre>' "$(status_badge "$d3_status")"
-        if [[ "$d3_status" == "pending" ]]; then
-            printf '<span class="muted">no merge yet — d3j has no working CLI</span>'
-        elif [[ "$d3_status" == "unavailable" ]]; then
-            printf '<span class="muted">d3j binary not found</span>'
-        else
-            html_escape <"$d3_out"
-        fi
-        printf '</pre></figure>\n</div>\n'
+        printf '<h2>Merged output</h2>\n<div class="grid grid-3">\n'
+        output_block "diff3" "$df_status" "$df_out"
+        output_block "mergiraf" "$mg_status" "$mg_out"
+        output_block "d3j" "$d3_status" "$d3_out"
+        printf '</div>\n'
 
         if [[ "$agree" == "differ" ]]; then
             printf '<h2>Difference (mergiraf &rarr; d3j)</h2>\n<pre class="diff">'
@@ -161,45 +175,47 @@ render_scenario() {
         page_foot
     } >"$outdir/$name.html"
 
-    rm -f "$mg_out" "$d3_out"
+    rm -f "$df_out" "$mg_out" "$d3_out"
 
     # Emit one matrix row on stdout for the index to collect.
-    printf '%s\t%s\t%s\t%s\n' "$name" "$mg_status" "$d3_status" "$agree"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$df_status" "$mg_status" "$d3_status" "$agree"
 }
 
 render_index() {
     local outdir="$1" rows="$2"
     {
-        page_head "d3j vs. mergiraf" "style.css"
-        printf '<h1>d3j vs. mergiraf</h1>\n'
+        page_head "d3j vs. mergiraf vs. diff3" "style.css"
+        printf '<h1>d3j vs. mergiraf vs. diff3</h1>\n'
         cat <<'EOF'
 <p>How <a href="https://github.com/kejadlen/d3j">d3j</a>'s structural
 merges compare with <a href="https://mergiraf.org">mergiraf</a>'s over a
-corpus of scenarios. d3j is early — where its column reads
+corpus of scenarios, with GNU <code>diff3</code> as the line-based
+baseline both are trying to beat. d3j is early — where its column reads
 <span class="badge badge-pending">pending</span>, its merge engine does
 not exist yet, and the page fills in as it lands.</p>
 
 <h2>Approach</h2>
 <table class="approach">
-<thead><tr><th>Aspect</th><th>d3j</th><th>mergiraf</th></tr></thead>
+<thead><tr><th>Aspect</th><th>d3j</th><th>mergiraf</th><th>diff3</th></tr></thead>
 <tbody>
-<tr><td>Matching</td><td>Anchored Zhang&ndash;Shasha, base&rarr;each branch</td><td>GumTree classic across all three pairs</td></tr>
-<tr><td>Core object</td><td>Partial inclusion map, merged as a pushout</td><td>PCS triples, 3DM/Spork-style changeset union</td></tr>
-<tr><td>On failure</td><td>Reports a conflict; never falls back to text</td><td>Falls back to line-based diff3</td></tr>
-<tr><td>Correctness</td><td>Universality checker as oracle + self-check</td><td>Pragmatic; no formal guarantee</td></tr>
+<tr><td>Unit</td><td>Syntax tree nodes</td><td>Syntax tree nodes</td><td>Lines</td></tr>
+<tr><td>Matching</td><td>Anchored Zhang&ndash;Shasha, base&rarr;each branch</td><td>GumTree classic across all three pairs</td><td>Longest common subsequence, base&rarr;each branch</td></tr>
+<tr><td>Core object</td><td>Partial inclusion map, merged as a pushout</td><td>PCS triples, 3DM/Spork-style changeset union</td><td>Hunks; overlapping or adjacent hunks conflict</td></tr>
+<tr><td>On failure</td><td>Reports a conflict; never falls back to text</td><td>Falls back to line-based diff3</td><td>Conflict markers around the overlapping region</td></tr>
+<tr><td>Correctness</td><td>Universality checker as oracle + self-check</td><td>Pragmatic; no formal guarantee</td><td>None; syntax-blind</td></tr>
 </tbody>
 </table>
 
 <h2>Scenarios</h2>
 <table class="matrix">
-<thead><tr><th>Scenario</th><th>mergiraf</th><th>d3j</th><th>agree?</th></tr></thead>
+<thead><tr><th>Scenario</th><th>diff3</th><th>mergiraf</th><th>d3j</th><th>d3j = mergiraf?</th></tr></thead>
 <tbody>
 EOF
-        local name mg d3 agree
-        while IFS=$'\t' read -r name mg d3 agree; do
+        local name df mg d3 agree
+        while IFS=$'\t' read -r name df mg d3 agree; do
             [[ -z "$name" ]] && continue
-            printf '<tr><td><a href="%s.html">%s</a></td><td>%s</td><td>%s</td><td class="agree-%s">%s</td></tr>\n' \
-                "$name" "$name" "$(status_badge "$mg")" "$(status_badge "$d3")" "$agree" "$agree"
+            printf '<tr><td><a href="%s.html">%s</a></td><td>%s</td><td>%s</td><td>%s</td><td class="agree-%s">%s</td></tr>\n' \
+                "$name" "$name" "$(status_badge "$df")" "$(status_badge "$mg")" "$(status_badge "$d3")" "$agree" "$agree"
         done <<<"$rows"
         cat <<'EOF'
 </tbody>

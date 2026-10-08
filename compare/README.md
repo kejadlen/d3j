@@ -1,23 +1,25 @@
 # Comparison site
 
 A generated static site for reviewing how d3j's merges differ from
-[mergiraf](https://mergiraf.org)'s. `generate.sh` runs both tools over
-every scenario in `scenarios/` and renders the results side by side. The
+[mergiraf](https://mergiraf.org)'s, with GNU `diff3` alongside as the
+line-based baseline. `generate.sh` runs all three tools over every
+scenario in `scenarios/` and renders the results side by side. The
 design and rationale live in
 [`docs/plans/2026-07-23-comparison-site-design.md`](../docs/plans/2026-07-23-comparison-site-design.md).
 
 ## Running locally
 
-Prerequisites: `mergiraf` on your `PATH` (or pointed at via `MERGIRAF`),
-and a d3j build.
+Prerequisites: `diff3` (from GNU diffutils) and `mergiraf` on your
+`PATH`, and a d3j build.
 
 ```sh
 cargo build
 D3J=target/debug/d3j ./compare/generate.sh dist
 ```
 
-Open `dist/index.html`. Both tools default to `PATH`; override the
-`MERGIRAF` and `D3J` environment variables to point at specific binaries.
+Open `dist/index.html`. All three tools default to `PATH`; override the
+`DIFF3`, `MERGIRAF`, and `D3J` environment variables to point at specific
+binaries.
 Set `TRACE=1` to trace the generator.
 
 d3j has no working merge yet, so its column reads "pending" until the CLI
